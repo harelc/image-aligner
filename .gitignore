@@ -37,6 +37,8 @@ Thumbs.db
 
 # Project specific
 aligned_output/
+align_from/
+align_to/
 *.pyc
 
 # Claude Code
