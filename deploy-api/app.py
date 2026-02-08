@@ -6,11 +6,14 @@ and the rest of the Animation Taskforce 2026
 """
 
 import io
+import os
 import base64
+import subprocess
+import tempfile
 import warnings
 import cv2
 import numpy as np
-from fastapi import FastAPI, File, UploadFile, HTTPException
+from fastapi import FastAPI, File, UploadFile, Form, HTTPException
 from fastapi.responses import HTMLResponse, Response
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
@@ -190,7 +193,204 @@ def full_histogram_matching(source, target, mask=None):
     return np.clip(result, 0, 255).astype(np.uint8)
 
 
-def align_image(source_img, target_img):
+# ============== Post-Processing ==============
+
+# Level configs: (blur_sigma_mult, blur_sigma_min, motion_min, crf_boost)
+PP_LEVELS = {
+    0: None,  # disabled
+    1: {'sigma_mult': 1.0, 'sigma_min': 0.0, 'motion_min': 1, 'crf_boost': 0},
+    2: {'sigma_mult': 1.5, 'sigma_min': 0.5, 'motion_min': 3, 'crf_boost': 5},
+    3: {'sigma_mult': 2.0, 'sigma_min': 0.8, 'motion_min': 5, 'crf_boost': 10},
+}
+
+
+def detect_foreground_mask(aligned, target, threshold=25, min_area=500):
+    diff = cv2.absdiff(aligned, target)
+    diff_gray = cv2.cvtColor(diff, cv2.COLOR_BGR2GRAY)
+    _, binary = cv2.threshold(diff_gray, threshold, 255, cv2.THRESH_BINARY)
+    kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (15, 15))
+    binary = cv2.morphologyEx(binary, cv2.MORPH_CLOSE, kernel, iterations=2)
+    binary = cv2.morphologyEx(binary, cv2.MORPH_OPEN, kernel, iterations=1)
+    num_labels, labels, stats, _ = cv2.connectedComponentsWithStats(binary, connectivity=8)
+    cleaned = np.zeros_like(binary)
+    for i in range(1, num_labels):
+        if stats[i, cv2.CC_STAT_AREA] >= min_area:
+            cleaned[labels == i] = 255
+    return cv2.GaussianBlur(cleaned.astype(np.float32) / 255.0, (31, 31), 0)
+
+
+def estimate_blur_level(image):
+    gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
+    laplacian_var = cv2.Laplacian(gray, cv2.CV_64F).var()
+    if laplacian_var > 500:
+        return 0.0
+    elif laplacian_var < 10:
+        return 3.0
+    return max(0.0, 2.5 - np.log10(laplacian_var) * 0.9)
+
+
+def estimate_motion_blur(image):
+    gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY).astype(np.float64)
+    f = np.fft.fft2(gray)
+    fshift = np.fft.fftshift(f)
+    magnitude = np.log1p(np.abs(fshift))
+    h, w = magnitude.shape
+    cy, cx = h // 2, w // 2
+    best_angle = 0.0
+    min_energy = float('inf')
+    max_energy = float('-inf')
+    radius = min(h, w) // 4
+    for angle_deg in range(0, 180, 5):
+        angle_rad = np.deg2rad(angle_deg)
+        dx, dy = np.cos(angle_rad), np.sin(angle_rad)
+        energy, count = 0.0, 0
+        for r in range(5, radius):
+            x, y = int(cx + r * dx), int(cy + r * dy)
+            if 0 <= x < w and 0 <= y < h:
+                energy += magnitude[y, x]
+                count += 1
+            x, y = int(cx - r * dx), int(cy - r * dy)
+            if 0 <= x < w and 0 <= y < h:
+                energy += magnitude[y, x]
+                count += 1
+        if count > 0:
+            avg_energy = energy / count
+            if avg_energy < min_energy:
+                min_energy = avg_energy
+                best_angle = angle_deg
+            if avg_energy > max_energy:
+                max_energy = avg_energy
+    blur_angle = (best_angle + 90) % 180
+    anisotropy = (max_energy - min_energy) / (max_energy + 1e-6)
+    kernel_size = 1 if anisotropy < 0.05 else max(1, int(anisotropy * 25))
+    return kernel_size, blur_angle
+
+
+def estimate_crf(image):
+    gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY).astype(np.float64)
+    h, w = gray.shape
+    laplacian = cv2.Laplacian(gray, cv2.CV_64F)
+    hf_energy = np.mean(np.abs(laplacian))
+    block_diffs = []
+    for x in range(4, w - 1, 4):
+        block_diffs.append(np.mean(np.abs(gray[:, x] - gray[:, x - 1])))
+    for y in range(4, h - 1, 4):
+        block_diffs.append(np.mean(np.abs(gray[y, :] - gray[y - 1, :])))
+    interior_diffs = []
+    for x in range(3, w - 1, 4):
+        if x % 4 != 0:
+            interior_diffs.append(np.mean(np.abs(gray[:, x] - gray[:, x - 1])))
+    avg_block = np.median(block_diffs) if block_diffs else 0
+    avg_interior = np.median(interior_diffs) if interior_diffs else 1
+    blockiness = avg_block / (avg_interior + 1e-6)
+    if hf_energy > 30:
+        crf_from_hf = 15
+    elif hf_energy > 15:
+        crf_from_hf = 23
+    elif hf_energy > 8:
+        crf_from_hf = 30
+    else:
+        crf_from_hf = 38
+    crf_from_blockiness = 18 + int((blockiness - 1.0) * 20)
+    crf = int(0.6 * crf_from_hf + 0.4 * crf_from_blockiness)
+    return max(0, min(51, crf))
+
+
+def apply_h264_compression(image, crf=23):
+    h, w = image.shape[:2]
+    with tempfile.TemporaryDirectory() as tmpdir:
+        in_path = os.path.join(tmpdir, 'in.png')
+        out_path = os.path.join(tmpdir, 'out.mp4')
+        dec_path = os.path.join(tmpdir, 'dec.png')
+        cv2.imwrite(in_path, image)
+        subprocess.run([
+            'ffmpeg', '-y', '-hide_banner', '-loglevel', 'error',
+            '-i', in_path,
+            '-c:v', 'libx264', '-crf', str(crf),
+            '-pix_fmt', 'yuv420p', '-frames:v', '1',
+            out_path
+        ], check=True, capture_output=True)
+        subprocess.run([
+            'ffmpeg', '-y', '-hide_banner', '-loglevel', 'error',
+            '-i', out_path, '-frames:v', '1', dec_path
+        ], check=True, capture_output=True)
+        result = cv2.imread(dec_path)
+    if result.shape[:2] != (h, w):
+        result = cv2.resize(result, (w, h), interpolation=cv2.INTER_LANCZOS4)
+    return result
+
+
+def apply_motion_blur(image, kernel_size=11, angle=0.0):
+    if kernel_size <= 1:
+        return image.copy()
+    kernel = np.zeros((kernel_size, kernel_size), dtype=np.float32)
+    center = kernel_size // 2
+    angle_rad = np.deg2rad(angle)
+    dx, dy = np.cos(angle_rad), np.sin(angle_rad)
+    for i in range(kernel_size):
+        t = i - center
+        x, y = int(round(center + t * dx)), int(round(center + t * dy))
+        if 0 <= x < kernel_size and 0 <= y < kernel_size:
+            kernel[y, x] = 1.0
+    kernel /= kernel.sum() + 1e-8
+    return cv2.filter2D(image, -1, kernel)
+
+
+def apply_gaussian_blur(image, sigma):
+    if sigma <= 0:
+        return image.copy()
+    ksize = int(np.ceil(sigma * 6)) | 1
+    return cv2.GaussianBlur(image, (ksize, ksize), sigma)
+
+
+def postprocess_foreground(aligned, target, level=2):
+    if level <= 0 or level not in PP_LEVELS:
+        return aligned
+
+    cfg = PP_LEVELS[level]
+
+    # Estimate target degradation
+    blur_sigma = estimate_blur_level(target)
+    motion_kernel, motion_angle = estimate_motion_blur(target)
+    crf = estimate_crf(target)
+
+    # Detect foreground
+    fg_mask = detect_foreground_mask(aligned, target)
+    if np.mean(fg_mask) < 0.001:
+        return aligned
+
+    degraded = aligned.copy()
+
+    # 1. Gaussian blur
+    applied_sigma = max(blur_sigma * cfg['sigma_mult'], cfg['sigma_min'])
+    if applied_sigma > 0:
+        degraded = apply_gaussian_blur(degraded, applied_sigma)
+
+    # 2. Motion blur
+    applied_motion = max(motion_kernel, cfg['motion_min'])
+    if applied_motion > 1:
+        degraded = apply_motion_blur(degraded, applied_motion, motion_angle)
+
+    # 3. H.264 CRF compression
+    applied_crf = min(crf + cfg['crf_boost'], 51)
+    try:
+        degraded = apply_h264_compression(degraded, applied_crf)
+    except (subprocess.CalledProcessError, FileNotFoundError):
+        # Fallback to JPEG
+        jpeg_q = max(5, 95 - applied_crf * 2)
+        _, encoded = cv2.imencode('.jpg', degraded, [int(cv2.IMWRITE_JPEG_QUALITY), jpeg_q])
+        degraded = cv2.imdecode(encoded, cv2.IMREAD_COLOR)
+
+    # Blend into foreground only
+    mask_3ch = fg_mask[:, :, np.newaxis]
+    result = (degraded.astype(np.float32) * mask_3ch +
+              aligned.astype(np.float32) * (1.0 - mask_3ch))
+    return np.clip(result, 0, 255).astype(np.uint8)
+
+
+# ============== Alignment Pipeline ==============
+
+def align_image(source_img, target_img, pp_level=2):
     target_h, target_w = target_img.shape[:2]
     target_size = (target_w, target_h)
     source_resized = cv2.resize(source_img, target_size, interpolation=cv2.INTER_LANCZOS4)
@@ -215,6 +415,11 @@ def align_image(source_img, target_img):
         aligned = source_resized
 
     result = full_histogram_matching(aligned, target_img, mask=color_mask)
+
+    # Post-processing
+    if pp_level > 0:
+        result = postprocess_foreground(result, target_img, level=pp_level)
+
     return result
 
 
@@ -245,13 +450,15 @@ def encode_image_png(img: np.ndarray) -> bytes:
 @app.post("/api/align")
 async def align_api(
     source: UploadFile = File(..., description="Source image to align"),
-    target: UploadFile = File(..., description="Target reference image")
+    target: UploadFile = File(..., description="Target reference image"),
+    pp: int = Form(2, description="Post-processing level 0-3 (0=none, default=2)")
 ):
     """
     Align source image to target image.
     Returns the aligned image as PNG.
     """
     try:
+        pp_level = max(0, min(3, pp))
         source_data = await source.read()
         target_data = await target.read()
 
@@ -261,7 +468,7 @@ async def align_api(
         if source_img is None or target_img is None:
             raise HTTPException(status_code=400, detail="Failed to decode images")
 
-        aligned = align_image(source_img, target_img)
+        aligned = align_image(source_img, target_img, pp_level=pp_level)
         png_bytes = encode_image_png(aligned)
 
         return Response(content=png_bytes, media_type="image/png")
@@ -273,13 +480,15 @@ async def align_api(
 @app.post("/api/align/base64")
 async def align_base64_api(
     source: UploadFile = File(...),
-    target: UploadFile = File(...)
+    target: UploadFile = File(...),
+    pp: int = Form(2, description="Post-processing level 0-3 (0=none, default=2)")
 ):
     """
     Align source image to target image.
     Returns the aligned image as base64-encoded PNG.
     """
     try:
+        pp_level = max(0, min(3, pp))
         source_data = await source.read()
         target_data = await target.read()
 
@@ -289,7 +498,7 @@ async def align_base64_api(
         if source_img is None or target_img is None:
             raise HTTPException(status_code=400, detail="Failed to decode images")
 
-        aligned = align_image(source_img, target_img)
+        aligned = align_image(source_img, target_img, pp_level=pp_level)
         png_bytes = encode_image_png(aligned)
         b64 = base64.b64encode(png_bytes).decode('utf-8')
 
@@ -356,6 +565,28 @@ HTML_CONTENT = """
         .upload-box h3 { margin-bottom: 0.5rem; }
         .upload-box.source h3 { color: #8be9fd; }
         .upload-box.target h3 { color: #ffb86c; }
+        .options-row {
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            gap: 1.5rem;
+            margin-bottom: 2rem;
+            flex-wrap: wrap;
+        }
+        .options-row label {
+            font-size: 0.95rem;
+            color: #aaa;
+        }
+        .pp-select {
+            background: rgba(255,255,255,0.08);
+            color: #e8e8e8;
+            border: 1px solid rgba(255,255,255,0.2);
+            border-radius: 6px;
+            padding: 0.5rem 1rem;
+            font-size: 0.95rem;
+            cursor: pointer;
+        }
+        .pp-select option { background: #1a1a2e; color: #e8e8e8; }
         .btn {
             display: block;
             width: 100%;
@@ -417,28 +648,38 @@ HTML_CONTENT = """
 <body>
     <div class="container">
         <div class="dedication">
-            <h2>Dedicated with ♥ love and devotion to</h2>
+            <h2>Dedicated with &#9829; love and devotion to</h2>
             <div class="names">Alon Y., Daniel B., Denis Z., Tal S.</div>
             <div class="team">and the rest of the Animation Taskforce 2026</div>
         </div>
 
-        <h1>🎯 Image Aligner</h1>
+        <h1>&#127919; Image Aligner</h1>
         <p class="subtitle">Geometric alignment with background-aware color matching</p>
 
         <div class="upload-grid">
             <div class="upload-box source" onclick="document.getElementById('sourceInput').click()">
                 <input type="file" id="sourceInput" accept="image/*">
-                <h3>📷 Source Image</h3>
+                <h3>&#128247; Source Image</h3>
                 <p>Click to upload</p>
             </div>
             <div class="upload-box target" onclick="document.getElementById('targetInput').click()">
                 <input type="file" id="targetInput" accept="image/*">
-                <h3>🎯 Target Reference</h3>
+                <h3>&#127919; Target Reference</h3>
                 <p>Click to upload</p>
             </div>
         </div>
 
-        <button class="btn" id="alignBtn" disabled onclick="alignImages()">✨ Align Images</button>
+        <div class="options-row">
+            <label for="ppLevel">Post-processing:</label>
+            <select id="ppLevel" class="pp-select">
+                <option value="0">0 - None</option>
+                <option value="1">1 - Weak</option>
+                <option value="2" selected>2 - Medium (default)</option>
+                <option value="3">3 - Strong</option>
+            </select>
+        </div>
+
+        <button class="btn" id="alignBtn" disabled onclick="alignImages()">&#10024; Align Images</button>
 
         <div class="loading" id="loading">
             <div class="spinner"></div>
@@ -446,19 +687,20 @@ HTML_CONTENT = """
         </div>
 
         <div class="result" id="result">
-            <h2>✨ Aligned Result</h2>
+            <h2>&#10024; Aligned Result</h2>
             <img id="resultImg" src="">
             <br>
             <a id="downloadLink" download="aligned.png">Download Aligned Image</a>
         </div>
 
         <div class="api-docs">
-            <h2>📡 API Usage</h2>
+            <h2>&#128225; API Usage</h2>
             <p>POST to <code>/api/align</code> with multipart form data:</p>
             <pre><code>// JavaScript (fetch)
 const formData = new FormData();
 formData.append('source', sourceFile);
 formData.append('target', targetFile);
+formData.append('pp', '2');  // 0=none, 1=weak, 2=medium, 3=strong
 
 const response = await fetch('/api/align', {
     method: 'POST',
@@ -467,7 +709,7 @@ const response = await fetch('/api/align', {
 const blob = await response.blob();
 const url = URL.createObjectURL(blob);
 
-// Or use /api/align/base64 to get base64 response:
+// Or use /api/align/base64 for base64 response:
 const response = await fetch('/api/align/base64', {
     method: 'POST',
     body: formData
@@ -518,6 +760,7 @@ console.log(data.image); // data:image/png;base64,...</code></pre>
                 const formData = new FormData();
                 formData.append('source', sourceFile);
                 formData.append('target', targetFile);
+                formData.append('pp', document.getElementById('ppLevel').value);
 
                 const response = await fetch('/api/align', {
                     method: 'POST',

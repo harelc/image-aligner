@@ -13,6 +13,8 @@ Handles:
 import argparse
 import os
 import re
+import subprocess
+import tempfile
 import warnings
 from pathlib import Path
 
@@ -563,6 +565,406 @@ def full_histogram_matching(source: np.ndarray, target: np.ndarray,
     return np.clip(result, 0, 255).astype(np.uint8)
 
 
+###############################################################################
+# Post-processing: match target frame's degradation on foreground region
+###############################################################################
+
+def detect_foreground_mask(aligned: np.ndarray, target: np.ndarray,
+                           threshold: int = 25, min_area: int = 500) -> np.ndarray:
+    """
+    Detect the manipulated/foreground region by diffing aligned image vs target.
+
+    Returns a soft float32 mask in [0, 1] where 1 = foreground.
+    """
+    diff = cv2.absdiff(aligned, target)
+    diff_gray = cv2.cvtColor(diff, cv2.COLOR_BGR2GRAY)
+
+    _, binary = cv2.threshold(diff_gray, threshold, 255, cv2.THRESH_BINARY)
+
+    # Morphological cleanup: close small gaps, remove noise
+    kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (15, 15))
+    binary = cv2.morphologyEx(binary, cv2.MORPH_CLOSE, kernel, iterations=2)
+    binary = cv2.morphologyEx(binary, cv2.MORPH_OPEN, kernel, iterations=1)
+
+    # Remove small connected components
+    num_labels, labels, stats, _ = cv2.connectedComponentsWithStats(binary, connectivity=8)
+    cleaned = np.zeros_like(binary)
+    for i in range(1, num_labels):
+        if stats[i, cv2.CC_STAT_AREA] >= min_area:
+            cleaned[labels == i] = 255
+
+    # Feather the edges for smooth blending
+    soft_mask = cv2.GaussianBlur(cleaned.astype(np.float32) / 255.0, (31, 31), 0)
+
+    return soft_mask
+
+
+def estimate_jpeg_quality(image: np.ndarray) -> int:
+    """
+    Estimate the JPEG compression quality of an image by measuring
+    blockiness artifacts along 8x8 DCT block boundaries.
+
+    Returns estimated quality 1-100 (lower = more compressed).
+    """
+    gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY).astype(np.float64)
+    h, w = gray.shape
+
+    # Measure discontinuities at 8x8 block boundaries (JPEG block size)
+    # Horizontal boundaries
+    h_diffs = []
+    for x in range(8, w - 1, 8):
+        col_diff = np.mean(np.abs(gray[:, x] - gray[:, x - 1]))
+        neighbors_diff = np.mean(np.abs(gray[:, x + 1] - gray[:, x - 2])) if x + 1 < w and x - 2 >= 0 else col_diff
+        if neighbors_diff > 0:
+            h_diffs.append(col_diff / (neighbors_diff + 1e-6))
+
+    # Vertical boundaries
+    v_diffs = []
+    for y in range(8, h - 1, 8):
+        row_diff = np.mean(np.abs(gray[y, :] - gray[y - 1, :]))
+        neighbors_diff = np.mean(np.abs(gray[y + 1, :] - gray[y - 2, :])) if y + 1 < h and y - 2 >= 0 else row_diff
+        if neighbors_diff > 0:
+            v_diffs.append(row_diff / (neighbors_diff + 1e-6))
+
+    if not h_diffs and not v_diffs:
+        return 95  # Can't detect, assume high quality
+
+    # Blockiness ratio: >1 means block boundaries are sharper than interior
+    blockiness = np.median(h_diffs + v_diffs)
+
+    # Map blockiness to estimated quality
+    # blockiness ~1.0 = no artifacts (quality ~95)
+    # blockiness ~1.5+ = heavy artifacts (quality ~10-30)
+    if blockiness <= 1.02:
+        return 95
+    elif blockiness >= 2.0:
+        return 10
+
+    quality = int(95 - (blockiness - 1.0) * 85)
+    return max(5, min(95, quality))
+
+
+def estimate_blur_level(image: np.ndarray) -> float:
+    """
+    Estimate the overall blurriness of an image using the variance of the
+    Laplacian (focus measure).
+
+    Returns a blur sigma estimate (0 = sharp, higher = blurrier).
+    """
+    gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
+    laplacian_var = cv2.Laplacian(gray, cv2.CV_64F).var()
+
+    # Laplacian variance: sharp images ~1000+, blurry ~10-100
+    # Map to Gaussian sigma estimate
+    if laplacian_var > 500:
+        return 0.0  # Sharp, no blur needed
+    elif laplacian_var < 10:
+        return 3.0  # Very blurry
+
+    # Inverse relationship: lower variance = higher blur
+    sigma = max(0.0, 2.5 - np.log10(laplacian_var) * 0.9)
+    return sigma
+
+
+def estimate_motion_blur(image: np.ndarray) -> tuple[int, float]:
+    """
+    Estimate the dominant motion blur direction and magnitude by analyzing
+    the power spectrum of the image.
+
+    Returns (kernel_size, angle_degrees).
+    """
+    gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY).astype(np.float64)
+
+    # Compute FFT and power spectrum
+    f = np.fft.fft2(gray)
+    fshift = np.fft.fftshift(f)
+    magnitude = np.log1p(np.abs(fshift))
+
+    h, w = magnitude.shape
+    cy, cx = h // 2, w // 2
+
+    # Analyze directional energy in the frequency domain
+    # Motion blur creates a dark line through the center of the spectrum
+    # perpendicular to the blur direction
+    best_angle = 0.0
+    min_energy = float('inf')
+    max_energy = float('-inf')
+
+    radius = min(h, w) // 4  # Analysis radius
+
+    for angle_deg in range(0, 180, 5):
+        angle_rad = np.deg2rad(angle_deg)
+        dx = np.cos(angle_rad)
+        dy = np.sin(angle_rad)
+
+        # Sample along this direction
+        energy = 0.0
+        count = 0
+        for r in range(5, radius):
+            x = int(cx + r * dx)
+            y = int(cy + r * dy)
+            if 0 <= x < w and 0 <= y < h:
+                energy += magnitude[y, x]
+                count += 1
+            x = int(cx - r * dx)
+            y = int(cy - r * dy)
+            if 0 <= x < w and 0 <= y < h:
+                energy += magnitude[y, x]
+                count += 1
+
+        if count > 0:
+            avg_energy = energy / count
+            if avg_energy < min_energy:
+                min_energy = avg_energy
+                best_angle = angle_deg  # This is perpendicular to blur
+            if avg_energy > max_energy:
+                max_energy = avg_energy
+
+    # The blur direction is perpendicular to the spectral dark line
+    blur_angle = (best_angle + 90) % 180
+
+    # Estimate magnitude from the anisotropy ratio
+    anisotropy = (max_energy - min_energy) / (max_energy + 1e-6)
+
+    # Low anisotropy = no directional blur; high = strong motion blur
+    if anisotropy < 0.05:
+        kernel_size = 1  # No motion blur detected
+    else:
+        kernel_size = max(1, int(anisotropy * 25))
+
+    return kernel_size, blur_angle
+
+
+def estimate_target_degradation(target: np.ndarray) -> dict:
+    """
+    Analyze the target image to estimate its compression level,
+    overall blurriness, and motion blur characteristics.
+
+    Returns a dict with estimated parameters.
+    """
+    jpeg_quality = estimate_jpeg_quality(target)
+    blur_sigma = estimate_blur_level(target)
+    motion_kernel, motion_angle = estimate_motion_blur(target)
+
+    return {
+        'jpeg_quality': jpeg_quality,
+        'blur_sigma': blur_sigma,
+        'motion_kernel': motion_kernel,
+        'motion_angle': motion_angle,
+    }
+
+
+def estimate_crf(image: np.ndarray) -> int:
+    """
+    Estimate the H.264 CRF (Constant Rate Factor) of a video frame by
+    measuring high-frequency energy loss and blockiness.
+
+    H.264 uses 4x4 and 16x16 macroblocks with deblocking, so artifacts
+    are subtler than JPEG but follow similar patterns.
+
+    Returns estimated CRF 0-51 (0 = lossless, 51 = worst quality).
+    """
+    gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY).astype(np.float64)
+    h, w = gray.shape
+
+    # Measure high-frequency energy via Laplacian
+    laplacian = cv2.Laplacian(gray, cv2.CV_64F)
+    hf_energy = np.mean(np.abs(laplacian))
+
+    # Measure blockiness at 4x4 boundaries (H.264 transform block size)
+    block_diffs_4 = []
+    for x in range(4, w - 1, 4):
+        block_diffs_4.append(np.mean(np.abs(gray[:, x] - gray[:, x - 1])))
+    for y in range(4, h - 1, 4):
+        block_diffs_4.append(np.mean(np.abs(gray[y, :] - gray[y - 1, :])))
+
+    # Also at 16x16 macroblock boundaries
+    block_diffs_16 = []
+    for x in range(16, w - 1, 16):
+        block_diffs_16.append(np.mean(np.abs(gray[:, x] - gray[:, x - 1])))
+    for y in range(16, h - 1, 16):
+        block_diffs_16.append(np.mean(np.abs(gray[y, :] - gray[y - 1, :])))
+
+    # Interior pixel diffs for comparison
+    interior_diffs = []
+    for x in range(3, w - 1, 4):
+        if x % 4 != 0:
+            interior_diffs.append(np.mean(np.abs(gray[:, x] - gray[:, x - 1])))
+
+    avg_block = np.median(block_diffs_4) if block_diffs_4 else 0
+    avg_interior = np.median(interior_diffs) if interior_diffs else 1
+    blockiness = avg_block / (avg_interior + 1e-6)
+
+    # Measure loss of fine detail: ratio of energy in high vs low frequencies
+    blurred = cv2.GaussianBlur(gray, (5, 5), 1.0)
+    detail_loss = 1.0 - np.mean(np.abs(gray - blurred)) / (hf_energy + 1e-6)
+    detail_loss = np.clip(detail_loss, 0, 1)
+
+    # Combine signals into CRF estimate
+    # High blockiness + low HF energy + high detail loss = high CRF
+    if hf_energy > 30:
+        crf_from_hf = 15  # Lots of detail preserved
+    elif hf_energy > 15:
+        crf_from_hf = 23
+    elif hf_energy > 8:
+        crf_from_hf = 30
+    else:
+        crf_from_hf = 38
+
+    crf_from_blockiness = 18 + int((blockiness - 1.0) * 20)
+
+    crf = int(0.6 * crf_from_hf + 0.4 * crf_from_blockiness)
+    return max(0, min(51, crf))
+
+
+def apply_h264_compression(image: np.ndarray, crf: int = 23) -> np.ndarray:
+    """
+    Apply real H.264 compression artifacts by encoding a single frame
+    through ffmpeg at the given CRF, then decoding the result.
+
+    This produces authentic video codec artifacts: DCT ringing, deblocking
+    smoothing, macroblock quantization, banding in gradients.
+    """
+    h, w = image.shape[:2]
+    with tempfile.TemporaryDirectory() as tmpdir:
+        in_path = os.path.join(tmpdir, 'in.png')
+        out_path = os.path.join(tmpdir, 'out.mp4')
+        dec_path = os.path.join(tmpdir, 'dec.png')
+
+        cv2.imwrite(in_path, image)
+
+        # Encode single frame as H.264 at the given CRF
+        # Use yuv420p (standard chroma subsampling) for authentic artifacts
+        cmd_encode = [
+            'ffmpeg', '-y', '-hide_banner', '-loglevel', 'error',
+            '-i', in_path,
+            '-c:v', 'libx264', '-crf', str(crf),
+            '-pix_fmt', 'yuv420p',
+            '-frames:v', '1',
+            out_path
+        ]
+        subprocess.run(cmd_encode, check=True, capture_output=True)
+
+        # Decode back to PNG
+        cmd_decode = [
+            'ffmpeg', '-y', '-hide_banner', '-loglevel', 'error',
+            '-i', out_path,
+            '-frames:v', '1',
+            dec_path
+        ]
+        subprocess.run(cmd_decode, check=True, capture_output=True)
+
+        result = cv2.imread(dec_path)
+
+    # ffmpeg may change dimensions slightly due to yuv420p (must be even)
+    if result.shape[:2] != (h, w):
+        result = cv2.resize(result, (w, h), interpolation=cv2.INTER_LANCZOS4)
+
+    return result
+
+
+def apply_motion_blur(image: np.ndarray, kernel_size: int = 11,
+                      angle: float = 0.0) -> np.ndarray:
+    """Apply directional motion blur using a line kernel."""
+    if kernel_size <= 1:
+        return image.copy()
+
+    kernel = np.zeros((kernel_size, kernel_size), dtype=np.float32)
+    center = kernel_size // 2
+    angle_rad = np.deg2rad(angle)
+    dx = np.cos(angle_rad)
+    dy = np.sin(angle_rad)
+
+    for i in range(kernel_size):
+        t = i - center
+        x = int(round(center + t * dx))
+        y = int(round(center + t * dy))
+        if 0 <= x < kernel_size and 0 <= y < kernel_size:
+            kernel[y, x] = 1.0
+
+    kernel /= kernel.sum() + 1e-8
+    return cv2.filter2D(image, -1, kernel)
+
+
+def apply_gaussian_blur(image: np.ndarray, sigma: float) -> np.ndarray:
+    """Apply Gaussian blur with the given sigma."""
+    if sigma <= 0:
+        return image.copy()
+    ksize = int(np.ceil(sigma * 6)) | 1  # Ensure odd kernel size
+    return cv2.GaussianBlur(image, (ksize, ksize), sigma)
+
+
+def postprocess_foreground(aligned: np.ndarray, target: np.ndarray) -> np.ndarray:
+    """
+    Degrade the foreground region of the aligned image to match the target
+    frame's compression, blur, and motion blur characteristics.
+
+    Estimates CRF, blur, and motion blur from the target, then applies
+    a stronger-than-estimated degradation to the foreground to ensure it
+    blends convincingly with the surrounding frame.
+
+    Args:
+        aligned: Aligned (and color-matched) image
+        target: Reference/target image
+
+    Returns:
+        Post-processed image with matched degradation on foreground
+    """
+    # Estimate target frame's degradation
+    params = estimate_target_degradation(target)
+    crf = estimate_crf(target)
+    print(f"    Estimated target degradation:")
+    print(f"      JPEG quality: ~{params['jpeg_quality']}")
+    print(f"      H.264 CRF: ~{crf}")
+    print(f"      Blur sigma: {params['blur_sigma']:.2f}")
+    print(f"      Motion blur: kernel={params['motion_kernel']}px, angle={params['motion_angle']:.0f}°")
+
+    # Detect foreground region
+    fg_mask = detect_foreground_mask(aligned, target)
+    fg_coverage = np.mean(fg_mask) * 100
+    print(f"    Foreground mask coverage: {fg_coverage:.1f}%")
+
+    if fg_coverage < 0.1:
+        print(f"    No significant foreground detected, skipping post-processing")
+        return aligned
+
+    # Apply degradation chain with boosted strength
+    # The foreground starts too clean, so we push harder than the estimate
+    degraded = aligned.copy()
+
+    # 1. Gaussian blur — boost sigma to ensure the foreground isn't sharper
+    #    than the surrounding frame
+    boosted_sigma = max(params['blur_sigma'] * 1.5, 0.5)
+    print(f"    Applying Gaussian blur sigma={boosted_sigma:.2f}")
+    degraded = apply_gaussian_blur(degraded, boosted_sigma)
+
+    # 2. Motion blur — always apply at least a small kernel
+    motion_kernel = max(params['motion_kernel'], 3)
+    print(f"    Applying motion blur kernel={motion_kernel}px, angle={params['motion_angle']:.0f}°")
+    degraded = apply_motion_blur(degraded, motion_kernel, params['motion_angle'])
+
+    # 3. H.264 CRF compression — the key step for video frame matching
+    #    Push CRF higher (worse quality) to make artifacts visible
+    applied_crf = min(crf + 5, 51)
+    print(f"    Applying H.264 compression CRF={applied_crf}")
+    try:
+        degraded = apply_h264_compression(degraded, applied_crf)
+    except (subprocess.CalledProcessError, FileNotFoundError) as e:
+        # Fallback to JPEG if ffmpeg not available
+        print(f"    H.264 encoding failed ({e}), falling back to JPEG")
+        jpeg_q = max(5, params['jpeg_quality'] - 15)
+        encode_param = [int(cv2.IMWRITE_JPEG_QUALITY), jpeg_q]
+        _, encoded = cv2.imencode('.jpg', degraded, encode_param)
+        degraded = cv2.imdecode(encoded, cv2.IMREAD_COLOR)
+
+    # Blend: foreground gets the degraded version, background stays clean
+    mask_3ch = fg_mask[:, :, np.newaxis]
+    result = (degraded.astype(np.float32) * mask_3ch +
+              aligned.astype(np.float32) * (1.0 - mask_3ch))
+
+    return np.clip(result, 0, 255).astype(np.uint8)
+
+
 def compute_diff_image(img1: np.ndarray, img2: np.ndarray, amplify: float = 3.0) -> np.ndarray:
     """
     Compute a colored difference image between two images.
@@ -595,25 +997,20 @@ def compute_diff_image(img1: np.ndarray, img2: np.ndarray, amplify: float = 3.0)
 def create_visualization_panel(naive_resized: np.ndarray,
                                 aligned: np.ndarray,
                                 target: np.ndarray,
-                                title: str = "") -> np.ndarray:
+                                title: str = "",
+                                postprocessed: np.ndarray = None) -> np.ndarray:
     """
-    Create a visualization panel with 5 images:
-    Row 1: [Naive Resized] [Aligned] [Target/Reference]
-    Row 2: [Diff: Naive vs Target] [Diff: Aligned vs Target]
+    Create a visualization panel.
 
-    Args:
-        naive_resized: Source image naively resized to target dimensions
-        aligned: Geometrically aligned (and color matched) image
-        target: Reference/target image
+    Without post-processing (3 cols):
+      Row 1: [Naive Resized] [Aligned] [Target/Reference]
+      Row 2: [Diff: Naive vs Target] [Diff: Aligned vs Target] [empty]
 
-    Returns:
-        Visualization panel as numpy array
+    With post-processing (4 cols):
+      Row 1: [Naive Resized] [Aligned] [Post-processed] [Target/Reference]
+      Row 2: [Diff: Naive] [Diff: Aligned] [Diff: Post-processed] [empty]
     """
     h, w = target.shape[:2]
-
-    # Compute difference images
-    diff_naive = compute_diff_image(naive_resized, target)
-    diff_aligned = compute_diff_image(aligned, target)
 
     # Create labels
     label_height = 40
@@ -632,19 +1029,39 @@ def create_visualization_panel(naive_resized: np.ndarray,
         cv2.putText(label_bar, text, (text_x, text_y), font, font_scale, font_color, font_thickness)
         return np.vstack([label_bar, img])
 
-    # Add labels to all images
-    naive_labeled = add_label(naive_resized, "Naive Resize")
-    aligned_labeled = add_label(aligned, "After Alignment")
-    target_labeled = add_label(target, "Target Reference")
-    diff_naive_labeled = add_label(diff_naive, "Diff: Naive vs Target")
-    diff_aligned_labeled = add_label(diff_aligned, "Diff: Aligned vs Target")
-
-    # Create empty placeholder for bottom row (to balance 3 vs 2)
     empty = np.full((h + label_height, w, 3), bg_color, dtype=np.uint8)
 
-    # Build rows
-    row1 = np.hstack([naive_labeled, aligned_labeled, target_labeled])
-    row2 = np.hstack([diff_naive_labeled, diff_aligned_labeled, empty])
+    # Compute difference images
+    diff_naive = compute_diff_image(naive_resized, target)
+    diff_aligned = compute_diff_image(aligned, target)
+
+    if postprocessed is not None:
+        diff_pp = compute_diff_image(postprocessed, target)
+        diff_aligned_vs_pp = compute_diff_image(aligned, postprocessed)
+
+        row1 = np.hstack([
+            add_label(naive_resized, "Naive Resize"),
+            add_label(aligned, "Aligned"),
+            add_label(postprocessed, "Post-processed"),
+            add_label(target, "Target Reference"),
+        ])
+        row2 = np.hstack([
+            add_label(diff_naive, "Diff: Naive vs Target"),
+            add_label(diff_aligned, "Diff: Aligned vs Target"),
+            add_label(diff_aligned_vs_pp, "Diff: Aligned vs Post-proc"),
+            add_label(diff_pp, "Diff: Post-proc vs Target"),
+        ])
+    else:
+        row1 = np.hstack([
+            add_label(naive_resized, "Naive Resize"),
+            add_label(aligned, "After Alignment"),
+            add_label(target, "Target Reference"),
+        ])
+        row2 = np.hstack([
+            add_label(diff_naive, "Diff: Naive vs Target"),
+            add_label(diff_aligned, "Diff: Aligned vs Target"),
+            empty,
+        ])
 
     # Add title bar if provided
     if title:
@@ -760,7 +1177,8 @@ def align_image(source_img: np.ndarray, target_img: np.ndarray,
 
 def process_pairs(align_to_dir: Path, align_from_dir: Path, output_dir: Path,
                   use_affine: bool = False, color_method: str = 'optimal_transport',
-                  suffix: str = '_aligned', create_visualization: bool = True):
+                  suffix: str = '_aligned', create_visualization: bool = True,
+                  postprocess: bool = False):
     """Process all image pairs."""
     pairs = find_matching_pairs(align_to_dir, align_from_dir)
 
@@ -794,10 +1212,17 @@ def process_pairs(align_to_dir: Path, align_from_dir: Path, output_dir: Path,
             color_method=color_method
         )
 
-        # Save aligned image with suffix
+        # Optional post-processing: match target degradation on foreground
+        pp_result = None
+        if postprocess:
+            print("    Post-processing: matching target degradation on foreground...")
+            pp_result = postprocess_foreground(aligned, target_img)
+
+        # Save final image (post-processed if enabled, otherwise aligned)
+        final = pp_result if pp_result is not None else aligned
         out_name = f"{src_path.stem}{suffix}{src_path.suffix}"
         out_path = output_dir / out_name
-        cv2.imwrite(str(out_path), aligned)
+        cv2.imwrite(str(out_path), final)
         print(f"  Saved: {out_path}")
 
         # Create and save visualization panel
@@ -808,7 +1233,8 @@ def process_pairs(align_to_dir: Path, align_from_dir: Path, output_dir: Path,
                 naive_resized=naive_resized,
                 aligned=aligned,
                 target=target_img,
-                title=title
+                title=title,
+                postprocessed=pp_result
             )
             viz_name = f"{src_path.stem}_viz.png"
             viz_path = viz_dir / viz_name
@@ -820,7 +1246,8 @@ def process_pairs(align_to_dir: Path, align_from_dir: Path, output_dir: Path,
 
 def process_single_pair(source_path: Path, target_path: Path, output_path: Path,
                         use_affine: bool = False, color_method: str = 'full_histogram',
-                        create_visualization: bool = True):
+                        create_visualization: bool = True,
+                        postprocess: bool = False):
     """Process a single image pair."""
     print(f"Processing: {source_path.name} -> {target_path.name}")
 
@@ -838,9 +1265,16 @@ def process_single_pair(source_path: Path, target_path: Path, output_path: Path,
         color_method=color_method
     )
 
-    # Save aligned image
+    # Optional post-processing: match target degradation on foreground
+    pp_result = None
+    if postprocess:
+        print("    Post-processing: matching target degradation on foreground...")
+        pp_result = postprocess_foreground(aligned, target_img)
+
+    # Save final image (post-processed if enabled, otherwise aligned)
+    final = pp_result if pp_result is not None else aligned
     output_path.parent.mkdir(parents=True, exist_ok=True)
-    cv2.imwrite(str(output_path), aligned)
+    cv2.imwrite(str(output_path), final)
     print(f"  Saved: {output_path}")
 
     # Create and save visualization panel
@@ -851,7 +1285,8 @@ def process_single_pair(source_path: Path, target_path: Path, output_path: Path,
             naive_resized=naive_resized,
             aligned=aligned,
             target=target_img,
-            title=title
+            title=title,
+            postprocessed=pp_result
         )
         viz_path = output_path.parent / f"{output_path.stem}_viz.png"
         cv2.imwrite(str(viz_path), panel)
@@ -906,6 +1341,8 @@ Examples:
                         help='Suffix for output filenames in batch mode (default: _aligned)')
     parser.add_argument('--no-viz', action='store_true',
                         help='Disable visualization panel generation')
+    parser.add_argument('--postprocess', '-p', action='store_true',
+                        help='Post-process foreground to match target compression/blur')
 
     args = parser.parse_args()
 
@@ -929,7 +1366,8 @@ Examples:
             use_affine=args.affine,
             color_method=args.color,
             suffix=args.suffix,
-            create_visualization=not args.no_viz
+            create_visualization=not args.no_viz,
+            postprocess=args.postprocess
         )
 
     elif args.source and args.target:
@@ -955,7 +1393,8 @@ Examples:
             output_path,
             use_affine=args.affine,
             color_method=args.color,
-            create_visualization=not args.no_viz
+            create_visualization=not args.no_viz,
+            postprocess=args.postprocess
         )
 
     else:

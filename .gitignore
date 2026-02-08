@@ -37,6 +37,7 @@ Thumbs.db
 
 # Project specific
 aligned_output/
+aligned_output_no_pp/
 align_from/
 align_to/
 *.pyc
