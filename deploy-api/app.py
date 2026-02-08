@@ -198,9 +198,9 @@ def full_histogram_matching(source, target, mask=None):
 # Level configs: (blur_sigma_mult, blur_sigma_min, motion_min, crf_boost)
 PP_LEVELS = {
     0: None,  # disabled
-    1: {'sigma_mult': 1.0, 'sigma_min': 0.0, 'motion_min': 1, 'crf_boost': 0},
-    2: {'sigma_mult': 1.5, 'sigma_min': 0.5, 'motion_min': 3, 'crf_boost': 5},
-    3: {'sigma_mult': 2.0, 'sigma_min': 0.8, 'motion_min': 5, 'crf_boost': 10},
+    1: {'sigma_mult': 0.8, 'sigma_min': 0.0, 'motion_min': 1, 'crf_boost': 0},
+    2: {'sigma_mult': 1.1, 'sigma_min': 0.0, 'motion_min': 1, 'crf_boost': 2},
+    3: {'sigma_mult': 1.5, 'sigma_min': 0.3, 'motion_min': 3, 'crf_boost': 5},
 }
 
 

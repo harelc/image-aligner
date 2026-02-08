@@ -928,31 +928,27 @@ def postprocess_foreground(aligned: np.ndarray, target: np.ndarray) -> np.ndarra
         print(f"    No significant foreground detected, skipping post-processing")
         return aligned
 
-    # Apply degradation chain with boosted strength
-    # The foreground starts too clean, so we push harder than the estimate
     degraded = aligned.copy()
 
-    # 1. Gaussian blur — boost sigma to ensure the foreground isn't sharper
-    #    than the surrounding frame
-    boosted_sigma = max(params['blur_sigma'] * 1.5, 0.5)
-    print(f"    Applying Gaussian blur sigma={boosted_sigma:.2f}")
-    degraded = apply_gaussian_blur(degraded, boosted_sigma)
+    # 1. Gaussian blur — match the target's softness
+    applied_sigma = params['blur_sigma'] * 1.1
+    if applied_sigma > 0.2:
+        print(f"    Applying Gaussian blur sigma={applied_sigma:.2f}")
+        degraded = apply_gaussian_blur(degraded, applied_sigma)
 
-    # 2. Motion blur — always apply at least a small kernel
-    motion_kernel = max(params['motion_kernel'], 3)
-    print(f"    Applying motion blur kernel={motion_kernel}px, angle={params['motion_angle']:.0f}°")
-    degraded = apply_motion_blur(degraded, motion_kernel, params['motion_angle'])
+    # 2. Motion blur — only if detected in target
+    if params['motion_kernel'] > 1:
+        print(f"    Applying motion blur kernel={params['motion_kernel']}px, angle={params['motion_angle']:.0f}°")
+        degraded = apply_motion_blur(degraded, params['motion_kernel'], params['motion_angle'])
 
-    # 3. H.264 CRF compression — the key step for video frame matching
-    #    Push CRF higher (worse quality) to make artifacts visible
-    applied_crf = min(crf + 5, 51)
+    # 3. H.264 CRF compression — match the target's compression level
+    applied_crf = min(crf + 2, 51)
     print(f"    Applying H.264 compression CRF={applied_crf}")
     try:
         degraded = apply_h264_compression(degraded, applied_crf)
     except (subprocess.CalledProcessError, FileNotFoundError) as e:
-        # Fallback to JPEG if ffmpeg not available
         print(f"    H.264 encoding failed ({e}), falling back to JPEG")
-        jpeg_q = max(5, params['jpeg_quality'] - 15)
+        jpeg_q = max(10, params['jpeg_quality'] - 5)
         encode_param = [int(cv2.IMWRITE_JPEG_QUALITY), jpeg_q]
         _, encoded = cv2.imencode('.jpg', degraded, encode_param)
         degraded = cv2.imdecode(encoded, cv2.IMREAD_COLOR)
