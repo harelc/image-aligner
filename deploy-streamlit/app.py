@@ -303,6 +303,47 @@ def create_visualization_panel(naive_resized, aligned, target, title=""):
     return panel
 
 
+def detect_unedited_mask(aligned, target, threshold=45, min_edit_area=2000,
+                         safety_radius=8, blur_size=31):
+    diff = cv2.absdiff(aligned, target)
+    diff_gray = cv2.cvtColor(diff, cv2.COLOR_BGR2GRAY)
+    _, edited_binary = cv2.threshold(diff_gray, threshold, 255, cv2.THRESH_BINARY)
+
+    grow_kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (7, 7))
+    edited_binary = cv2.dilate(edited_binary, grow_kernel, iterations=1)
+
+    close_kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (31, 31))
+    edited_binary = cv2.morphologyEx(edited_binary, cv2.MORPH_CLOSE, close_kernel, iterations=1)
+
+    num_labels, labels, stats, _ = cv2.connectedComponentsWithStats(edited_binary, connectivity=8)
+    cleaned = np.zeros_like(edited_binary)
+    for i in range(1, num_labels):
+        if stats[i, cv2.CC_STAT_AREA] >= min_edit_area:
+            cleaned[labels == i] = 255
+    edited_binary = cleaned
+
+    if safety_radius > 0:
+        safety_kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE,
+                                                  (safety_radius * 2 + 1, safety_radius * 2 + 1))
+        edited_binary = cv2.dilate(edited_binary, safety_kernel, iterations=1)
+
+    unedited_binary = 255 - edited_binary
+
+    open_kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (41, 41))
+    unedited_binary = cv2.morphologyEx(unedited_binary, cv2.MORPH_OPEN, open_kernel, iterations=2)
+
+    blur_size = blur_size | 1
+    soft_mask = cv2.GaussianBlur(unedited_binary.astype(np.float32) / 255.0,
+                                 (blur_size, blur_size), 0)
+    return soft_mask
+
+
+def paste_unedited_regions(aligned, target, mask):
+    mask_3ch = mask[:, :, np.newaxis]
+    result = target.astype(np.float32) * mask_3ch + aligned.astype(np.float32) * (1.0 - mask_3ch)
+    return np.clip(result, 0, 255).astype(np.uint8)
+
+
 def align_image(source_img, target_img):
     """Main alignment function."""
     target_h, target_w = target_img.shape[:2]
@@ -340,6 +381,10 @@ def align_image(source_img, target_img):
 
     # Color matching
     result = full_histogram_matching(aligned, target_img, mask=color_mask)
+
+    # Paste back unedited regions from target
+    unedited_mask = detect_unedited_mask(result, target_img)
+    result = paste_unedited_regions(result, target_img, unedited_mask)
 
     return result, naive_resized, aligned
 

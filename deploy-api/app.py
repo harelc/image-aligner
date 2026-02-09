@@ -388,12 +388,56 @@ def postprocess_foreground(aligned, target, level=2):
     return np.clip(result, 0, 255).astype(np.uint8)
 
 
+# ============== Paste-back unedited regions ==============
+
+def detect_unedited_mask(aligned, target, threshold=45, min_edit_area=2000,
+                         safety_radius=8, blur_size=31):
+    diff = cv2.absdiff(aligned, target)
+    diff_gray = cv2.cvtColor(diff, cv2.COLOR_BGR2GRAY)
+    _, edited_binary = cv2.threshold(diff_gray, threshold, 255, cv2.THRESH_BINARY)
+
+    grow_kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (7, 7))
+    edited_binary = cv2.dilate(edited_binary, grow_kernel, iterations=1)
+
+    close_kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (31, 31))
+    edited_binary = cv2.morphologyEx(edited_binary, cv2.MORPH_CLOSE, close_kernel, iterations=1)
+
+    num_labels, labels, stats, _ = cv2.connectedComponentsWithStats(edited_binary, connectivity=8)
+    cleaned = np.zeros_like(edited_binary)
+    for i in range(1, num_labels):
+        if stats[i, cv2.CC_STAT_AREA] >= min_edit_area:
+            cleaned[labels == i] = 255
+    edited_binary = cleaned
+
+    if safety_radius > 0:
+        safety_kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE,
+                                                  (safety_radius * 2 + 1, safety_radius * 2 + 1))
+        edited_binary = cv2.dilate(edited_binary, safety_kernel, iterations=1)
+
+    unedited_binary = 255 - edited_binary
+
+    open_kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (41, 41))
+    unedited_binary = cv2.morphologyEx(unedited_binary, cv2.MORPH_OPEN, open_kernel, iterations=2)
+
+    blur_size = blur_size | 1
+    soft_mask = cv2.GaussianBlur(unedited_binary.astype(np.float32) / 255.0,
+                                 (blur_size, blur_size), 0)
+    return soft_mask
+
+
+def paste_unedited_regions(aligned, target, mask):
+    mask_3ch = mask[:, :, np.newaxis]
+    result = target.astype(np.float32) * mask_3ch + aligned.astype(np.float32) * (1.0 - mask_3ch)
+    return np.clip(result, 0, 255).astype(np.uint8)
+
+
 # ============== Alignment Pipeline ==============
 
 def align_image(source_img, target_img, pp_level=2):
     target_h, target_w = target_img.shape[:2]
     target_size = (target_w, target_h)
     source_resized = cv2.resize(source_img, target_size, interpolation=cv2.INTER_LANCZOS4)
+    naive_resized = source_resized.copy()
 
     kp_src, desc_src = extract_features(source_resized)
     kp_tgt, desc_tgt = extract_features(target_img)
@@ -416,11 +460,94 @@ def align_image(source_img, target_img, pp_level=2):
 
     result = full_histogram_matching(aligned, target_img, mask=color_mask)
 
-    # Post-processing
-    if pp_level > 0:
-        result = postprocess_foreground(result, target_img, level=pp_level)
+    # Paste back unedited regions from target
+    pre_paste = result.copy()
+    unedited_mask = detect_unedited_mask(result, target_img)
+    result = paste_unedited_regions(result, target_img, unedited_mask)
 
-    return result
+    # Post-processing (only affects edited regions, then re-paste)
+    pp_result = None
+    if pp_level > 0:
+        pp_result = postprocess_foreground(result, target_img, level=pp_level)
+        pp_result = paste_unedited_regions(pp_result, target_img, unedited_mask)
+
+    final = pp_result if pp_result is not None else result
+    return final, naive_resized, result, pre_paste, unedited_mask, pp_result
+
+
+def compute_diff_image(img1, img2, amplify=3.0):
+    gray1 = cv2.cvtColor(img1, cv2.COLOR_BGR2GRAY).astype(np.float32)
+    gray2 = cv2.cvtColor(img2, cv2.COLOR_BGR2GRAY).astype(np.float32)
+    abs_diff = np.abs(gray1 - gray2)
+    diff_vis = np.clip(abs_diff * amplify, 0, 255).astype(np.uint8)
+    return cv2.cvtColor(diff_vis, cv2.COLOR_GRAY2BGR)
+
+
+def create_visualization_panel(naive_resized, aligned, target, pre_paste=None,
+                                unedited_mask=None, postprocessed=None):
+    h, w = target.shape[:2]
+    label_height = 40
+    font = cv2.FONT_HERSHEY_SIMPLEX
+    font_scale = 0.7
+    font_thickness = 2
+    font_color = (255, 255, 255)
+    bg_color = (40, 40, 40)
+
+    def add_label(img, text):
+        label_bar = np.full((label_height, img.shape[1], 3), bg_color, dtype=np.uint8)
+        text_size = cv2.getTextSize(text, font, font_scale, font_thickness)[0]
+        text_x = (img.shape[1] - text_size[0]) // 2
+        text_y = (label_height + text_size[1]) // 2
+        cv2.putText(label_bar, text, (text_x, text_y), font, font_scale, font_color, font_thickness)
+        return np.vstack([label_bar, img])
+
+    empty = np.full((h + label_height, w, 3), bg_color, dtype=np.uint8)
+
+    mask_vis_bgr = None
+    if unedited_mask is not None:
+        mask_vis = (unedited_mask * 255).astype(np.uint8)
+        mask_vis_bgr = cv2.cvtColor(mask_vis, cv2.COLOR_GRAY2BGR)
+
+    diff_naive = compute_diff_image(naive_resized, target)
+    diff_aligned = compute_diff_image(aligned, target)
+    diff_pre_paste = compute_diff_image(pre_paste, target) if pre_paste is not None else None
+
+    if postprocessed is not None:
+        diff_pp = compute_diff_image(postprocessed, target)
+        diff_aligned_vs_pp = compute_diff_image(aligned, postprocessed)
+        row1_items = [
+            add_label(naive_resized, "Naive Resize"),
+            add_label(aligned, "Aligned+Pasted"),
+            add_label(postprocessed, "Post-processed"),
+            add_label(target, "Target Reference"),
+        ]
+        row2_items = [
+            add_label(diff_naive, "Diff: Naive vs Target"),
+            add_label(diff_pre_paste, "Diff: Pre-paste vs Target") if diff_pre_paste is not None else empty,
+            add_label(diff_aligned, "Diff: Pasted vs Target"),
+            add_label(diff_pp, "Diff: Post-proc vs Target"),
+        ]
+        if mask_vis_bgr is not None:
+            row1_items.append(add_label(mask_vis_bgr, "Unedited Mask"))
+            row2_items.append(empty)
+    else:
+        row1_items = [
+            add_label(naive_resized, "Naive Resize"),
+            add_label(aligned, "Aligned+Pasted"),
+            add_label(target, "Target Reference"),
+        ]
+        row2_items = [
+            add_label(diff_naive, "Diff: Naive vs Target"),
+            add_label(diff_pre_paste, "Diff: Pre-paste vs Target") if diff_pre_paste is not None else empty,
+            add_label(diff_aligned, "Diff: Pasted vs Target"),
+        ]
+        if mask_vis_bgr is not None:
+            row1_items.append(add_label(mask_vis_bgr, "Unedited Mask"))
+            row2_items.append(empty)
+
+    row1 = np.hstack(row1_items)
+    row2 = np.hstack(row2_items)
+    return np.vstack([row1, row2])
 
 
 # ============== FastAPI App ==============
@@ -468,8 +595,8 @@ async def align_api(
         if source_img is None or target_img is None:
             raise HTTPException(status_code=400, detail="Failed to decode images")
 
-        aligned = align_image(source_img, target_img, pp_level=pp_level)
-        png_bytes = encode_image_png(aligned)
+        final, *_ = align_image(source_img, target_img, pp_level=pp_level)
+        png_bytes = encode_image_png(final)
 
         return Response(content=png_bytes, media_type="image/png")
 
@@ -498,11 +625,55 @@ async def align_base64_api(
         if source_img is None or target_img is None:
             raise HTTPException(status_code=400, detail="Failed to decode images")
 
-        aligned = align_image(source_img, target_img, pp_level=pp_level)
-        png_bytes = encode_image_png(aligned)
+        final, *_ = align_image(source_img, target_img, pp_level=pp_level)
+        png_bytes = encode_image_png(final)
         b64 = base64.b64encode(png_bytes).decode('utf-8')
 
         return {"image": f"data:image/png;base64,{b64}"}
+
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.post("/api/align/viz")
+async def align_viz_api(
+    source: UploadFile = File(...),
+    target: UploadFile = File(...),
+    pp: int = Form(2, description="Post-processing level 0-3 (0=none, default=2)")
+):
+    """
+    Align source image to target and return visualization panel + final result.
+    """
+    try:
+        pp_level = max(0, min(3, pp))
+        source_data = await source.read()
+        target_data = await target.read()
+
+        source_img = decode_image(source_data)
+        target_img = decode_image(target_data)
+
+        if source_img is None or target_img is None:
+            raise HTTPException(status_code=400, detail="Failed to decode images")
+
+        final, naive_resized, pasted, pre_paste, unedited_mask, pp_result = \
+            align_image(source_img, target_img, pp_level=pp_level)
+
+        panel = create_visualization_panel(
+            naive_resized, pasted, target_img,
+            pre_paste=pre_paste,
+            unedited_mask=unedited_mask,
+            postprocessed=pp_result
+        )
+
+        panel_bytes = encode_image_png(panel)
+        final_bytes = encode_image_png(final)
+        panel_b64 = base64.b64encode(panel_bytes).decode('utf-8')
+        final_b64 = base64.b64encode(final_bytes).decode('utf-8')
+
+        return {
+            "panel": f"data:image/png;base64,{panel_b64}",
+            "image": f"data:image/png;base64,{final_b64}",
+        }
 
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
@@ -687,8 +858,8 @@ HTML_CONTENT = """
         </div>
 
         <div class="result" id="result">
-            <h2>&#10024; Aligned Result</h2>
-            <img id="resultImg" src="">
+            <h2>&#10024; Visualization</h2>
+            <img id="panelImg" src="" style="max-width:100%">
             <br>
             <a id="downloadLink" download="aligned.png">Download Aligned Image</a>
         </div>
@@ -762,18 +933,17 @@ console.log(data.image); // data:image/png;base64,...</code></pre>
                 formData.append('target', targetFile);
                 formData.append('pp', document.getElementById('ppLevel').value);
 
-                const response = await fetch('/api/align', {
+                const response = await fetch('/api/align/viz', {
                     method: 'POST',
                     body: formData
                 });
 
                 if (!response.ok) throw new Error('Alignment failed');
 
-                const blob = await response.blob();
-                const url = URL.createObjectURL(blob);
+                const data = await response.json();
 
-                document.getElementById('resultImg').src = url;
-                document.getElementById('downloadLink').href = url;
+                document.getElementById('panelImg').src = data.panel;
+                document.getElementById('downloadLink').href = data.image;
                 result.classList.add('show');
             } catch (err) {
                 alert('Error: ' + err.message);

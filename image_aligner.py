@@ -565,6 +565,90 @@ def full_histogram_matching(source: np.ndarray, target: np.ndarray,
     return np.clip(result, 0, 255).astype(np.uint8)
 
 
+def detect_unedited_mask(aligned: np.ndarray, target: np.ndarray,
+                         threshold: int = 45, min_edit_area: int = 2000,
+                         safety_radius: int = 8, blur_size: int = 31) -> np.ndarray:
+    """
+    Detect which pixels are close enough to the target to be considered unedited.
+
+    Uses a permissive threshold, then cleans up the mask with morphological
+    operations: close small holes in the unedited region, remove small isolated
+    edited blobs (noise from compression/color-matching artifacts), and apply
+    a small safety margin around genuine edits before feathering.
+
+    Args:
+        aligned: Aligned and color-matched image (BGR)
+        target: Target/reference image (BGR)
+        threshold: Max per-pixel grayscale difference to count as "unedited"
+        min_edit_area: Minimum contiguous edited-pixel area to keep; smaller
+                       blobs are reclassified as unedited
+        safety_radius: Pixels to dilate genuine edited regions as safety margin
+        blur_size: Gaussian blur kernel size for feathering mask edges (must be odd)
+
+    Returns:
+        Float32 mask in [0, 1] where 1 = unedited (paste target), 0 = edited (keep aligned)
+    """
+    diff = cv2.absdiff(aligned, target)
+    diff_gray = cv2.cvtColor(diff, cv2.COLOR_BGR2GRAY)
+
+    # Permissive threshold: only clearly different pixels count as edited
+    _, edited_binary = cv2.threshold(diff_gray, threshold, 255, cv2.THRESH_BINARY)
+
+    # Dilate edited pixels slightly to consolidate nearby fragments
+    grow_kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (7, 7))
+    edited_binary = cv2.dilate(edited_binary, grow_kernel, iterations=1)
+
+    # Morphological close to merge nearby edited blobs into contiguous areas
+    close_kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (31, 31))
+    edited_binary = cv2.morphologyEx(edited_binary, cv2.MORPH_CLOSE, close_kernel, iterations=1)
+
+    # Remove small isolated edited components (noise from color matching)
+    num_labels, labels, stats, _ = cv2.connectedComponentsWithStats(edited_binary, connectivity=8)
+    cleaned = np.zeros_like(edited_binary)
+    for i in range(1, num_labels):
+        if stats[i, cv2.CC_STAT_AREA] >= min_edit_area:
+            cleaned[labels == i] = 255
+    edited_binary = cleaned
+
+    # Safety dilation around genuine edits
+    if safety_radius > 0:
+        safety_kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE,
+                                                  (safety_radius * 2 + 1, safety_radius * 2 + 1))
+        edited_binary = cv2.dilate(edited_binary, safety_kernel, iterations=1)
+
+    # Invert: 255 = unedited, 0 = edited
+    unedited_binary = 255 - edited_binary
+
+    # Remove white speckles inside edited regions (opening on unedited mask)
+    open_kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (41, 41))
+    unedited_binary = cv2.morphologyEx(unedited_binary, cv2.MORPH_OPEN, open_kernel, iterations=2)
+
+    # Feather edges with Gaussian blur for smooth transitions
+    blur_size = blur_size | 1  # Ensure odd
+    soft_mask = cv2.GaussianBlur(unedited_binary.astype(np.float32) / 255.0,
+                                 (blur_size, blur_size), 0)
+
+    return soft_mask
+
+
+def paste_unedited_regions(aligned: np.ndarray, target: np.ndarray,
+                           mask: np.ndarray) -> np.ndarray:
+    """
+    Paste original target pixels back into unedited regions.
+
+    Args:
+        aligned: Aligned and color-matched image (BGR)
+        target: Target/reference image (BGR)
+        mask: Float32 mask in [0, 1] where 1 = paste target, 0 = keep aligned
+
+    Returns:
+        Composited image with target pixels in unedited regions
+    """
+    mask_3ch = mask[:, :, np.newaxis]
+    result = target.astype(np.float32) * mask_3ch + aligned.astype(np.float32) * (1.0 - mask_3ch)
+    return np.clip(result, 0, 255).astype(np.uint8)
+
+
 ###############################################################################
 # Post-processing: match target frame's degradation on foreground region
 ###############################################################################
@@ -963,48 +1047,35 @@ def postprocess_foreground(aligned: np.ndarray, target: np.ndarray) -> np.ndarra
 
 def compute_diff_image(img1: np.ndarray, img2: np.ndarray, amplify: float = 3.0) -> np.ndarray:
     """
-    Compute a colored difference image between two images.
-    Red channel shows where img1 > img2, blue shows where img2 > img1.
+    Compute an amplified absolute-difference image (grayscale).
+    White = large difference, black = identical.
     """
-    # Convert to float and grayscale for diff computation
     gray1 = cv2.cvtColor(img1, cv2.COLOR_BGR2GRAY).astype(np.float32)
     gray2 = cv2.cvtColor(img2, cv2.COLOR_BGR2GRAY).astype(np.float32)
 
-    diff = gray1 - gray2
+    abs_diff = np.abs(gray1 - gray2)
+    diff_vis = np.clip(abs_diff * amplify, 0, 255).astype(np.uint8)
 
-    # Create RGB diff visualization
-    diff_img = np.zeros((*gray1.shape, 3), dtype=np.uint8)
-
-    # Red where img1 is brighter (positive diff)
-    pos_diff = np.clip(diff * amplify, 0, 255).astype(np.uint8)
-    # Blue where img2 is brighter (negative diff)
-    neg_diff = np.clip(-diff * amplify, 0, 255).astype(np.uint8)
-
-    diff_img[:, :, 2] = pos_diff  # Red channel (BGR format)
-    diff_img[:, :, 0] = neg_diff  # Blue channel
-
-    # Add some green where they're similar for better visibility
-    similar = 255 - np.clip(np.abs(diff) * amplify, 0, 255).astype(np.uint8)
-    diff_img[:, :, 1] = similar // 4  # Subtle green
-
-    return diff_img
+    return cv2.cvtColor(diff_vis, cv2.COLOR_GRAY2BGR)
 
 
 def create_visualization_panel(naive_resized: np.ndarray,
                                 aligned: np.ndarray,
                                 target: np.ndarray,
                                 title: str = "",
-                                postprocessed: np.ndarray = None) -> np.ndarray:
+                                postprocessed: np.ndarray = None,
+                                unedited_mask: np.ndarray = None,
+                                pre_paste: np.ndarray = None) -> np.ndarray:
     """
     Create a visualization panel.
 
-    Without post-processing (3 cols):
-      Row 1: [Naive Resized] [Aligned] [Target/Reference]
-      Row 2: [Diff: Naive vs Target] [Diff: Aligned vs Target] [empty]
+    Without post-processing (4 cols):
+      Row 1: [Naive Resized] [Aligned+Pasted] [Target/Reference] [Unedited Mask]
+      Row 2: [Diff: Naive vs Target] [Diff: Aligned vs Target] [empty] [empty]
 
-    With post-processing (4 cols):
-      Row 1: [Naive Resized] [Aligned] [Post-processed] [Target/Reference]
-      Row 2: [Diff: Naive] [Diff: Aligned] [Diff: Post-processed] [empty]
+    With post-processing (5 cols):
+      Row 1: [Naive] [Aligned+Pasted] [Post-processed] [Target] [Unedited Mask]
+      Row 2: [Diff: Naive] [Diff: Aligned] [Diff: Aligned vs PP] [Diff: PP vs Target] [empty]
     """
     h, w = target.shape[:2]
 
@@ -1027,37 +1098,57 @@ def create_visualization_panel(naive_resized: np.ndarray,
 
     empty = np.full((h + label_height, w, 3), bg_color, dtype=np.uint8)
 
+    # Create mask visualization if provided
+    if unedited_mask is not None:
+        mask_vis = (unedited_mask * 255).astype(np.uint8)
+        mask_vis_bgr = cv2.cvtColor(mask_vis, cv2.COLOR_GRAY2BGR)
+    else:
+        mask_vis_bgr = None
+
     # Compute difference images
     diff_naive = compute_diff_image(naive_resized, target)
     diff_aligned = compute_diff_image(aligned, target)
+    diff_pre_paste = compute_diff_image(pre_paste, target) if pre_paste is not None else None
 
     if postprocessed is not None:
         diff_pp = compute_diff_image(postprocessed, target)
         diff_aligned_vs_pp = compute_diff_image(aligned, postprocessed)
 
-        row1 = np.hstack([
+        row1_items = [
             add_label(naive_resized, "Naive Resize"),
-            add_label(aligned, "Aligned"),
+            add_label(aligned, "Aligned+Pasted"),
             add_label(postprocessed, "Post-processed"),
             add_label(target, "Target Reference"),
-        ])
-        row2 = np.hstack([
+        ]
+        row2_items = [
             add_label(diff_naive, "Diff: Naive vs Target"),
-            add_label(diff_aligned, "Diff: Aligned vs Target"),
-            add_label(diff_aligned_vs_pp, "Diff: Aligned vs Post-proc"),
+            add_label(diff_aligned, "Diff: Pasted vs Target"),
+            add_label(diff_aligned_vs_pp, "Diff: Pasted vs Post-proc"),
             add_label(diff_pp, "Diff: Post-proc vs Target"),
-        ])
+        ]
+        if mask_vis_bgr is not None:
+            row1_items.append(add_label(mask_vis_bgr, "Unedited Mask"))
+            row2_items.append(add_label(diff_pre_paste, "Diff: Pre-paste vs Target") if diff_pre_paste is not None else empty)
+
+        row1 = np.hstack(row1_items)
+        row2 = np.hstack(row2_items)
     else:
-        row1 = np.hstack([
+        row1_items = [
             add_label(naive_resized, "Naive Resize"),
-            add_label(aligned, "After Alignment"),
+            add_label(aligned, "Aligned+Pasted"),
             add_label(target, "Target Reference"),
-        ])
-        row2 = np.hstack([
+        ]
+        row2_items = [
             add_label(diff_naive, "Diff: Naive vs Target"),
-            add_label(diff_aligned, "Diff: Aligned vs Target"),
-            empty,
-        ])
+            add_label(diff_pre_paste, "Diff: Pre-paste vs Target") if diff_pre_paste is not None else empty,
+            add_label(diff_aligned, "Diff: Pasted vs Target"),
+        ]
+        if mask_vis_bgr is not None:
+            row1_items.append(add_label(mask_vis_bgr, "Unedited Mask"))
+            row2_items.append(empty)
+
+        row1 = np.hstack(row1_items)
+        row2 = np.hstack(row2_items)
 
     # Add title bar if provided
     if title:
@@ -1076,7 +1167,7 @@ def create_visualization_panel(naive_resized: np.ndarray,
 
 def align_image(source_img: np.ndarray, target_img: np.ndarray,
                 use_affine: bool = False,
-                color_method: str = 'optimal_transport') -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+                color_method: str = 'optimal_transport') -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
     """
     Align source image to target image.
 
@@ -1087,7 +1178,9 @@ def align_image(source_img: np.ndarray, target_img: np.ndarray,
         color_method: 'optimal_transport' or 'histogram'
 
     Returns:
-        Tuple of (final_result, naive_resized, aligned_before_color)
+        Tuple of (final_result, naive_resized, aligned_before_color, color_matched_pre_paste, unedited_mask)
+        where color_matched_pre_paste is the result after color matching but before paste-back,
+        and unedited_mask is a float32 [0,1] mask (1=unedited/target, 0=edited/aligned)
     """
     target_h, target_w = target_img.shape[:2]
     target_size = (target_w, target_h)
@@ -1168,7 +1261,15 @@ def align_image(source_img: np.ndarray, target_img: np.ndarray,
     else:  # 'histogram' or fallback
         result = histogram_matching_rgb(aligned, target_img, mask=color_mask)
 
-    return result, naive_resized, aligned
+    # Step 7: Paste back unedited regions from target
+    print("    Detecting unedited regions and pasting back target pixels...")
+    color_matched_pre_paste = result.copy()
+    unedited_mask = detect_unedited_mask(result, target_img)
+    unedited_coverage = np.mean(unedited_mask) * 100
+    print(f"    Unedited region coverage: {unedited_coverage:.1f}%")
+    result = paste_unedited_regions(result, target_img, unedited_mask)
+
+    return result, naive_resized, aligned, color_matched_pre_paste, unedited_mask
 
 
 def process_pairs(align_to_dir: Path, align_from_dir: Path, output_dir: Path,
@@ -1202,7 +1303,7 @@ def process_pairs(align_to_dir: Path, align_from_dir: Path, output_dir: Path,
         print(f"  Target: {target_img.shape[1]}x{target_img.shape[0]}")
 
         # Align
-        aligned, naive_resized, aligned_geom = align_image(
+        aligned, naive_resized, aligned_geom, pre_paste, unedited_mask = align_image(
             source_img, target_img,
             use_affine=use_affine,
             color_method=color_method
@@ -1213,6 +1314,7 @@ def process_pairs(align_to_dir: Path, align_from_dir: Path, output_dir: Path,
         if postprocess:
             print("    Post-processing: matching target degradation on foreground...")
             pp_result = postprocess_foreground(aligned, target_img)
+            pp_result = paste_unedited_regions(pp_result, target_img, unedited_mask)
 
         # Save final image (post-processed if enabled, otherwise aligned)
         final = pp_result if pp_result is not None else aligned
@@ -1230,7 +1332,9 @@ def process_pairs(align_to_dir: Path, align_from_dir: Path, output_dir: Path,
                 aligned=aligned,
                 target=target_img,
                 title=title,
-                postprocessed=pp_result
+                postprocessed=pp_result,
+                unedited_mask=unedited_mask,
+                pre_paste=pre_paste
             )
             viz_name = f"{src_path.stem}_viz.png"
             viz_path = viz_dir / viz_name
@@ -1255,7 +1359,7 @@ def process_single_pair(source_path: Path, target_path: Path, output_path: Path,
     print(f"  Target: {target_img.shape[1]}x{target_img.shape[0]}")
 
     # Align
-    aligned, naive_resized, aligned_geom = align_image(
+    aligned, naive_resized, aligned_geom, pre_paste, unedited_mask = align_image(
         source_img, target_img,
         use_affine=use_affine,
         color_method=color_method
@@ -1266,6 +1370,7 @@ def process_single_pair(source_path: Path, target_path: Path, output_path: Path,
     if postprocess:
         print("    Post-processing: matching target degradation on foreground...")
         pp_result = postprocess_foreground(aligned, target_img)
+        pp_result = paste_unedited_regions(pp_result, target_img, unedited_mask)
 
     # Save final image (post-processed if enabled, otherwise aligned)
     final = pp_result if pp_result is not None else aligned
@@ -1282,7 +1387,9 @@ def process_single_pair(source_path: Path, target_path: Path, output_path: Path,
             aligned=aligned,
             target=target_img,
             title=title,
-            postprocessed=pp_result
+            postprocessed=pp_result,
+            unedited_mask=unedited_mask,
+            pre_paste=pre_paste
         )
         viz_path = output_path.parent / f"{output_path.stem}_viz.png"
         cv2.imwrite(str(viz_path), panel)
