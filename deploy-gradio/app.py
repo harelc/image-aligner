@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
 Image Aligner - Gradio Web Interface
-Dedicated with love and devotion to Alon Y., Daniel B., Denis Z., Tal S.
+Dedicated with love and devotion to Alon Y., Daniel B., Denis Z., Tal S., Adi B.
 and the rest of the Animation Taskforce 2026
 """
 
@@ -453,7 +453,7 @@ custom_css = """
 dedication_html = """
 <div class="dedication">
     <h2>Dedicated with <span class="heart">♥</span> love and devotion to</h2>
-    <div class="names">Alon Y., Daniel B., Denis Z., Tal S.</div>
+    <div class="names">Alon Y., Daniel B., Denis Z., Tal S., Adi B.</div>
     <div class="team">and the rest of the Animation Taskforce 2026</div>
 </div>
 """

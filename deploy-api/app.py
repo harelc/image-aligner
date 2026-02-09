@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
 Image Aligner - FastAPI Web Interface with API
-Dedicated with love and devotion to Alon Y., Daniel B., Denis Z., Tal S.
+Dedicated with love and devotion to Alon Y., Daniel B., Denis Z., Tal S., Adi B.
 and the rest of the Animation Taskforce 2026
 """
 
@@ -820,7 +820,7 @@ HTML_CONTENT = """
     <div class="container">
         <div class="dedication">
             <h2>Dedicated with &#9829; love and devotion to</h2>
-            <div class="names">Alon Y., Daniel B., Denis Z., Tal S.</div>
+            <div class="names">Alon Y., Daniel B., Denis Z., Tal S., Adi B.</div>
             <div class="team">and the rest of the Animation Taskforce 2026</div>
         </div>
 

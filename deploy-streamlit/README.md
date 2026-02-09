@@ -13,4 +13,4 @@ pinned: false
 
 Geometric alignment with background-aware color matching.
 
-Dedicated with love and devotion to Alon Y., Daniel B., Denis Z., Tal S. and the rest of the Animation Taskforce 2026.
+Dedicated with love and devotion to Alon Y., Daniel B., Denis Z., Tal S., Adi B. and the rest of the Animation Taskforce 2026.
