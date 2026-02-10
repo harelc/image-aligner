@@ -75,8 +75,12 @@ def extract_features(img: np.ndarray) -> tuple:
     """Extract SIFT features from grayscale image."""
     gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
 
+    # Scale nfeatures with image resolution instead of fixed 10000
+    n_pixels = img.shape[0] * img.shape[1]
+    nfeatures = min(10000, max(2000, n_pixels // 200))
+
     # Use SIFT for robust feature detection
-    sift = cv2.SIFT_create(nfeatures=10000, contrastThreshold=0.02, edgeThreshold=15)
+    sift = cv2.SIFT_create(nfeatures=nfeatures, contrastThreshold=0.02, edgeThreshold=15)
     keypoints, descriptors = sift.detectAndCompute(gray, None)
 
     return keypoints, descriptors
@@ -203,27 +207,18 @@ def create_inlier_mask(keypoints: list, matches: list, inlier_mask: np.ndarray,
         Boolean mask where True indicates inlier/background regions
     """
     h, w = image_shape[:2]
-    mask = np.zeros((h, w), dtype=bool)
+    mask_img = np.zeros((h, w), dtype=np.uint8)
 
-    # Get inlier keypoint positions
+    # Draw filled circles at inlier keypoint positions using cv2.circle (C++ optimized)
     for i, m in enumerate(matches):
         if inlier_mask[i]:
             if use_target_keypoints:
                 pt = keypoints[m.trainIdx].pt
             else:
                 pt = keypoints[m.queryIdx].pt
-            x, y = int(pt[0]), int(pt[1])
+            cv2.circle(mask_img, (int(pt[0]), int(pt[1])), radius, 1, -1)
 
-            # Mark circular region around keypoint
-            y_min = max(0, y - radius)
-            y_max = min(h, y + radius + 1)
-            x_min = max(0, x - radius)
-            x_max = min(w, x + radius + 1)
-
-            # Create circular mask for this keypoint
-            yy, xx = np.ogrid[y_min:y_max, x_min:x_max]
-            circle = (xx - x) ** 2 + (yy - y) ** 2 <= radius ** 2
-            mask[y_min:y_max, x_min:x_max] |= circle
+    mask = mask_img.astype(bool)
 
     # Dilate the mask to expand coverage
     kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (radius, radius))
@@ -381,13 +376,8 @@ def _build_histogram_lookup(src_channel: np.ndarray, tgt_channel: np.ndarray,
     tgt_cdf = np.cumsum(tgt_hist).astype(np.float64)
     tgt_cdf = tgt_cdf / tgt_cdf[-1]
 
-    # Build lookup
-    lookup = np.zeros(n_bins, dtype=np.uint8)
-    tgt_idx = 0
-    for src_idx in range(n_bins):
-        while tgt_idx < n_bins - 1 and tgt_cdf[tgt_idx] < src_cdf[src_idx]:
-            tgt_idx += 1
-        lookup[src_idx] = tgt_idx
+    # Build lookup via vectorized binary search
+    lookup = np.searchsorted(tgt_cdf, src_cdf).astype(np.uint8)
 
     return lookup
 
@@ -448,12 +438,7 @@ def _build_histogram_lookup_float(src_channel: np.ndarray, tgt_channel: np.ndarr
     tgt_cdf = np.cumsum(tgt_hist).astype(np.float64)
     tgt_cdf = tgt_cdf / (tgt_cdf[-1] + 1e-10)
 
-    lookup = np.zeros(n_bins, dtype=np.float32)
-    tgt_idx = 0
-    for src_idx in range(n_bins):
-        while tgt_idx < n_bins - 1 and tgt_cdf[tgt_idx] < src_cdf[src_idx]:
-            tgt_idx += 1
-        lookup[src_idx] = tgt_idx
+    lookup = np.searchsorted(tgt_cdf, src_cdf).astype(np.float32)
 
     return lookup
 
@@ -513,13 +498,8 @@ def piecewise_linear_histogram_transfer(source: np.ndarray, target: np.ndarray,
         tgt_cdf = np.cumsum(tgt_hist).astype(np.float64)
         tgt_cdf = tgt_cdf / (tgt_cdf[-1] + 1e-10)  # Normalize
 
-        # Build lookup table using CDF matching
-        lookup = np.zeros(n_bins, dtype=np.float32)
-        tgt_idx = 0
-        for src_idx in range(n_bins):
-            while tgt_idx < n_bins - 1 and tgt_cdf[tgt_idx] < src_cdf[src_idx]:
-                tgt_idx += 1
-            lookup[src_idx] = tgt_idx
+        # Build lookup table using CDF matching (vectorized binary search)
+        lookup = np.searchsorted(tgt_cdf, src_cdf).astype(np.float32)
 
         # Apply lookup with interpolation for smoother results (globally)
         src_img = source[:, :, c].astype(np.float32)
@@ -532,6 +512,35 @@ def piecewise_linear_histogram_transfer(source: np.ndarray, target: np.ndarray,
         result[:, :, c] = (1 - src_frac) * lookup[src_floor] + src_frac * lookup[src_ceil]
 
     return np.clip(result, 0, 255).astype(np.uint8)
+
+
+def fast_color_transfer(source: np.ndarray, target: np.ndarray,
+                        mask: np.ndarray = None) -> np.ndarray:
+    """
+    Fast Reinhard-style color transfer in LAB space (mean+std matching per channel).
+
+    Much faster than optimal_transport (no matrix square roots) or full_histogram
+    (no 3-method blend). Produces comparable results for most image pairs.
+
+    Args:
+        source: Source image (BGR)
+        target: Target image (BGR)
+        mask: Optional boolean mask - statistics from masked regions only,
+              but transform is applied globally
+    """
+    src_lab = cv2.cvtColor(source, cv2.COLOR_BGR2LAB).astype(np.float32)
+    tgt_lab = cv2.cvtColor(target, cv2.COLOR_BGR2LAB).astype(np.float32)
+    if mask is not None:
+        src_stats = src_lab[mask]
+        tgt_stats = tgt_lab[mask]
+    else:
+        src_stats = src_lab.reshape(-1, 3)
+        tgt_stats = tgt_lab.reshape(-1, 3)
+    for i in range(3):
+        s_mean, s_std = src_stats[:, i].mean(), src_stats[:, i].std() + 1e-6
+        t_mean, t_std = tgt_stats[:, i].mean(), tgt_stats[:, i].std() + 1e-6
+        src_lab[:, :, i] = (src_lab[:, :, i] - s_mean) * (t_std / s_std) + t_mean
+    return cv2.cvtColor(np.clip(src_lab, 0, 255).astype(np.uint8), cv2.COLOR_LAB2BGR)
 
 
 def full_histogram_matching(source: np.ndarray, target: np.ndarray,
@@ -767,42 +776,51 @@ def estimate_motion_blur(image: np.ndarray) -> tuple[int, float]:
     h, w = magnitude.shape
     cy, cx = h // 2, w // 2
 
-    # Analyze directional energy in the frequency domain
+    # Analyze directional energy in the frequency domain — vectorized
     # Motion blur creates a dark line through the center of the spectrum
     # perpendicular to the blur direction
-    best_angle = 0.0
-    min_energy = float('inf')
-    max_energy = float('-inf')
-
     radius = min(h, w) // 4  # Analysis radius
 
-    for angle_deg in range(0, 180, 5):
-        angle_rad = np.deg2rad(angle_deg)
-        dx = np.cos(angle_rad)
-        dy = np.sin(angle_rad)
+    angles_deg = np.arange(0, 180, 5)
+    angles_rad = np.deg2rad(angles_deg)
+    rs = np.arange(5, radius)
 
-        # Sample along this direction
-        energy = 0.0
-        count = 0
-        for r in range(5, radius):
-            x = int(cx + r * dx)
-            y = int(cy + r * dy)
-            if 0 <= x < w and 0 <= y < h:
-                energy += magnitude[y, x]
-                count += 1
-            x = int(cx - r * dx)
-            y = int(cy - r * dy)
-            if 0 <= x < w and 0 <= y < h:
-                energy += magnitude[y, x]
-                count += 1
+    # dx[a], dy[a] for each angle
+    dx = np.cos(angles_rad)  # (n_angles,)
+    dy = np.sin(angles_rad)  # (n_angles,)
 
-        if count > 0:
-            avg_energy = energy / count
-            if avg_energy < min_energy:
-                min_energy = avg_energy
-                best_angle = angle_deg  # This is perpendicular to blur
-            if avg_energy > max_energy:
-                max_energy = avg_energy
+    # Build all sample coordinates: (n_radii, n_angles)
+    X_pos = (cx + np.outer(rs, dx)).astype(int)
+    Y_pos = (cy + np.outer(rs, dy)).astype(int)
+    X_neg = (cx - np.outer(rs, dx)).astype(int)
+    Y_neg = (cy - np.outer(rs, dy)).astype(int)
+
+    # Validity masks
+    valid_pos = (X_pos >= 0) & (X_pos < w) & (Y_pos >= 0) & (Y_pos < h)
+    valid_neg = (X_neg >= 0) & (X_neg < w) & (Y_neg >= 0) & (Y_neg < h)
+
+    # Sample magnitudes (use 0 for out-of-bounds, excluded by count)
+    energy_pos = np.where(valid_pos, magnitude[np.clip(Y_pos, 0, h - 1), np.clip(X_pos, 0, w - 1)], 0.0)
+    energy_neg = np.where(valid_neg, magnitude[np.clip(Y_neg, 0, h - 1), np.clip(X_neg, 0, w - 1)], 0.0)
+
+    # Sum per angle (axis=0 sums over radii)
+    total_energy = energy_pos.sum(axis=0) + energy_neg.sum(axis=0)
+    total_count = valid_pos.sum(axis=0) + valid_neg.sum(axis=0)
+
+    # Avoid division by zero for angles with no valid samples
+    valid_angles = total_count > 0
+    avg_energies = np.where(valid_angles, total_energy / (total_count + 1e-10), 0.0)
+
+    if valid_angles.any():
+        min_idx = np.argmin(np.where(valid_angles, avg_energies, np.inf))
+        max_idx = np.argmax(np.where(valid_angles, avg_energies, -np.inf))
+        best_angle = angles_deg[min_idx]
+        min_energy = avg_energies[min_idx]
+        max_energy = avg_energies[max_idx]
+    else:
+        best_angle = 0.0
+        min_energy = 0.0
+        max_energy = 0.0
 
     # The blur direction is perpendicular to the spectral dark line
     blur_angle = (best_angle + 90) % 180
@@ -855,28 +873,20 @@ def estimate_crf(image: np.ndarray) -> int:
     laplacian = cv2.Laplacian(gray, cv2.CV_64F)
     hf_energy = np.mean(np.abs(laplacian))
 
-    # Measure blockiness at 4x4 boundaries (H.264 transform block size)
-    block_diffs_4 = []
-    for x in range(4, w - 1, 4):
-        block_diffs_4.append(np.mean(np.abs(gray[:, x] - gray[:, x - 1])))
-    for y in range(4, h - 1, 4):
-        block_diffs_4.append(np.mean(np.abs(gray[y, :] - gray[y - 1, :])))
+    # Measure blockiness at 4x4 boundaries (H.264 transform block size) — vectorized
+    cols_4 = np.arange(4, w - 1, 4)
+    rows_4 = np.arange(4, h - 1, 4)
+    block_diffs_4_x = np.mean(np.abs(gray[:, cols_4] - gray[:, cols_4 - 1]), axis=0) if len(cols_4) else np.array([])
+    block_diffs_4_y = np.mean(np.abs(gray[rows_4, :] - gray[rows_4 - 1, :]), axis=1) if len(rows_4) else np.array([])
+    block_diffs_4 = np.concatenate([block_diffs_4_x, block_diffs_4_y])
 
-    # Also at 16x16 macroblock boundaries
-    block_diffs_16 = []
-    for x in range(16, w - 1, 16):
-        block_diffs_16.append(np.mean(np.abs(gray[:, x] - gray[:, x - 1])))
-    for y in range(16, h - 1, 16):
-        block_diffs_16.append(np.mean(np.abs(gray[y, :] - gray[y - 1, :])))
+    # Interior pixel diffs for comparison — vectorized
+    cols_interior = np.arange(3, w - 1, 4)
+    cols_interior = cols_interior[cols_interior % 4 != 0]
+    interior_diffs = np.mean(np.abs(gray[:, cols_interior] - gray[:, cols_interior - 1]), axis=0) if len(cols_interior) else np.array([])
 
-    # Interior pixel diffs for comparison
-    interior_diffs = []
-    for x in range(3, w - 1, 4):
-        if x % 4 != 0:
-            interior_diffs.append(np.mean(np.abs(gray[:, x] - gray[:, x - 1])))
-
-    avg_block = np.median(block_diffs_4) if block_diffs_4 else 0
-    avg_interior = np.median(interior_diffs) if interior_diffs else 1
+    avg_block = np.median(block_diffs_4) if len(block_diffs_4) else 0
+    avg_interior = np.median(interior_diffs) if len(interior_diffs) else 1
     blockiness = avg_block / (avg_interior + 1e-6)
 
     # Measure loss of fine detail: ratio of energy in high vs low frequencies
@@ -1246,7 +1256,9 @@ def align_image(source_img: np.ndarray, target_img: np.ndarray,
 
     # Step 6: Color matching (using background mask)
     print(f"    Applying color matching ({color_method}) on background regions...")
-    if color_method == 'optimal_transport':
+    if color_method == 'fast':
+        result = fast_color_transfer(aligned, target_img, mask=color_mask)
+    elif color_method == 'optimal_transport':
         try:
             result = optimal_transport_color_transfer(aligned, target_img, mask=color_mask)
         except Exception as e:
@@ -1273,7 +1285,7 @@ def align_image(source_img: np.ndarray, target_img: np.ndarray,
 
 
 def process_pairs(align_to_dir: Path, align_from_dir: Path, output_dir: Path,
-                  use_affine: bool = False, color_method: str = 'optimal_transport',
+                  use_affine: bool = False, color_method: str = 'fast',
                   suffix: str = '_aligned', create_visualization: bool = True,
                   postprocess: bool = False):
     """Process all image pairs."""
@@ -1345,7 +1357,7 @@ def process_pairs(align_to_dir: Path, align_from_dir: Path, output_dir: Path,
 
 
 def process_single_pair(source_path: Path, target_path: Path, output_path: Path,
-                        use_affine: bool = False, color_method: str = 'full_histogram',
+                        use_affine: bool = False, color_method: str = 'fast',
                         create_visualization: bool = True,
                         postprocess: bool = False):
     """Process a single image pair."""
@@ -1437,9 +1449,9 @@ Examples:
     parser.add_argument('--affine', '-a', action='store_true',
                         help='Use affine transform instead of homography')
     parser.add_argument('--color', '-c',
-                        choices=['full_histogram', 'optimal_transport', 'lab', 'cdf', 'histogram'],
-                        default='full_histogram',
-                        help='Color matching method (default: full_histogram)')
+                        choices=['fast', 'full_histogram', 'optimal_transport', 'lab', 'cdf', 'histogram'],
+                        default='fast',
+                        help='Color matching method (default: fast)')
     parser.add_argument('--suffix', '-s', default='_aligned',
                         help='Suffix for output filenames in batch mode (default: _aligned)')
     parser.add_argument('--no-viz', action='store_true',

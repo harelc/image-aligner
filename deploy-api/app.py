@@ -26,7 +26,9 @@ import uvicorn
 
 def extract_features(img: np.ndarray) -> tuple:
     gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
-    sift = cv2.SIFT_create(nfeatures=10000, contrastThreshold=0.02, edgeThreshold=15)
+    n_pixels = img.shape[0] * img.shape[1]
+    nfeatures = min(10000, max(2000, n_pixels // 200))
+    sift = cv2.SIFT_create(nfeatures=nfeatures, contrastThreshold=0.02, edgeThreshold=15)
     keypoints, descriptors = sift.detectAndCompute(gray, None)
     return keypoints, descriptors
 
@@ -68,16 +70,12 @@ def compute_homography(kp1, kp2, matches, ransac_reproj_thresh=8.0, confidence=0
 
 def create_inlier_mask(keypoints, matches, inlier_mask, image_shape, radius=50):
     h, w = image_shape[:2]
-    mask = np.zeros((h, w), dtype=bool)
+    mask_img = np.zeros((h, w), dtype=np.uint8)
     for i, m in enumerate(matches):
         if inlier_mask[i]:
             pt = keypoints[m.trainIdx].pt
-            x, y = int(pt[0]), int(pt[1])
-            y_min, y_max = max(0, y - radius), min(h, y + radius + 1)
-            x_min, x_max = max(0, x - radius), min(w, x + radius + 1)
-            yy, xx = np.ogrid[y_min:y_max, x_min:x_max]
-            circle = (xx - x) ** 2 + (yy - y) ** 2 <= radius ** 2
-            mask[y_min:y_max, x_min:x_max] |= circle
+            cv2.circle(mask_img, (int(pt[0]), int(pt[1])), radius, 1, -1)
+    mask = mask_img.astype(bool)
     kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (radius, radius))
     mask = cv2.dilate(mask.astype(np.uint8), kernel, iterations=2).astype(bool)
     return mask
@@ -90,12 +88,7 @@ def _build_histogram_lookup(src_channel, tgt_channel, n_bins=256):
     src_cdf = src_cdf / (src_cdf[-1] + 1e-10)
     tgt_cdf = np.cumsum(tgt_hist).astype(np.float64)
     tgt_cdf = tgt_cdf / (tgt_cdf[-1] + 1e-10)
-    lookup = np.zeros(n_bins, dtype=np.uint8)
-    tgt_idx = 0
-    for src_idx in range(n_bins):
-        while tgt_idx < n_bins - 1 and tgt_cdf[tgt_idx] < src_cdf[src_idx]:
-            tgt_idx += 1
-        lookup[src_idx] = tgt_idx
+    lookup = np.searchsorted(tgt_cdf, src_cdf).astype(np.uint8)
     return lookup
 
 
@@ -106,12 +99,7 @@ def _build_histogram_lookup_float(src_channel, tgt_channel, n_bins=256):
     src_cdf = src_cdf / (src_cdf[-1] + 1e-10)
     tgt_cdf = np.cumsum(tgt_hist).astype(np.float64)
     tgt_cdf = tgt_cdf / (tgt_cdf[-1] + 1e-10)
-    lookup = np.zeros(n_bins, dtype=np.float32)
-    tgt_idx = 0
-    for src_idx in range(n_bins):
-        while tgt_idx < n_bins - 1 and tgt_cdf[tgt_idx] < src_cdf[src_idx]:
-            tgt_idx += 1
-        lookup[src_idx] = tgt_idx
+    lookup = np.searchsorted(tgt_cdf, src_cdf).astype(np.float32)
     return lookup
 
 
@@ -168,12 +156,7 @@ def piecewise_linear_histogram_transfer(source, target, n_bins=256, mask=None):
         src_cdf = src_cdf / (src_cdf[-1] + 1e-10)
         tgt_cdf = np.cumsum(tgt_hist).astype(np.float64)
         tgt_cdf = tgt_cdf / (tgt_cdf[-1] + 1e-10)
-        lookup = np.zeros(n_bins, dtype=np.float32)
-        tgt_idx = 0
-        for src_idx in range(n_bins):
-            while tgt_idx < n_bins - 1 and tgt_cdf[tgt_idx] < src_cdf[src_idx]:
-                tgt_idx += 1
-            lookup[src_idx] = tgt_idx
+        lookup = np.searchsorted(tgt_cdf, src_cdf).astype(np.float32)
         src_img = source[:, :, c].astype(np.float32)
         src_floor = np.floor(src_img).astype(np.int32)
         src_ceil = np.minimum(src_floor + 1, n_bins - 1)
@@ -181,6 +164,22 @@ def piecewise_linear_histogram_transfer(source, target, n_bins=256, mask=None):
         src_floor = np.clip(src_floor, 0, n_bins - 1)
         result[:, :, c] = (1 - src_frac) * lookup[src_floor] + src_frac * lookup[src_ceil]
     return np.clip(result, 0, 255).astype(np.uint8)
+
+
+def fast_color_transfer(source, target, mask=None):
+    src_lab = cv2.cvtColor(source, cv2.COLOR_BGR2LAB).astype(np.float32)
+    tgt_lab = cv2.cvtColor(target, cv2.COLOR_BGR2LAB).astype(np.float32)
+    if mask is not None:
+        src_stats = src_lab[mask]
+        tgt_stats = tgt_lab[mask]
+    else:
+        src_stats = src_lab.reshape(-1, 3)
+        tgt_stats = tgt_lab.reshape(-1, 3)
+    for i in range(3):
+        s_mean, s_std = src_stats[:, i].mean(), src_stats[:, i].std() + 1e-6
+        t_mean, t_std = tgt_stats[:, i].mean(), tgt_stats[:, i].std() + 1e-6
+        src_lab[:, :, i] = (src_lab[:, :, i] - s_mean) * (t_std / s_std) + t_mean
+    return cv2.cvtColor(np.clip(src_lab, 0, 255).astype(np.uint8), cv2.COLOR_LAB2BGR)
 
 
 def full_histogram_matching(source, target, mask=None):
@@ -236,30 +235,32 @@ def estimate_motion_blur(image):
     magnitude = np.log1p(np.abs(fshift))
     h, w = magnitude.shape
     cy, cx = h // 2, w // 2
-    best_angle = 0.0
-    min_energy = float('inf')
-    max_energy = float('-inf')
     radius = min(h, w) // 4
-    for angle_deg in range(0, 180, 5):
-        angle_rad = np.deg2rad(angle_deg)
-        dx, dy = np.cos(angle_rad), np.sin(angle_rad)
-        energy, count = 0.0, 0
-        for r in range(5, radius):
-            x, y = int(cx + r * dx), int(cy + r * dy)
-            if 0 <= x < w and 0 <= y < h:
-                energy += magnitude[y, x]
-                count += 1
-            x, y = int(cx - r * dx), int(cy - r * dy)
-            if 0 <= x < w and 0 <= y < h:
-                energy += magnitude[y, x]
-                count += 1
-        if count > 0:
-            avg_energy = energy / count
-            if avg_energy < min_energy:
-                min_energy = avg_energy
-                best_angle = angle_deg
-            if avg_energy > max_energy:
-                max_energy = avg_energy
+    angles_deg = np.arange(0, 180, 5)
+    angles_rad = np.deg2rad(angles_deg)
+    rs = np.arange(5, radius)
+    dx = np.cos(angles_rad)
+    dy = np.sin(angles_rad)
+    X_pos = (cx + np.outer(rs, dx)).astype(int)
+    Y_pos = (cy + np.outer(rs, dy)).astype(int)
+    X_neg = (cx - np.outer(rs, dx)).astype(int)
+    Y_neg = (cy - np.outer(rs, dy)).astype(int)
+    valid_pos = (X_pos >= 0) & (X_pos < w) & (Y_pos >= 0) & (Y_pos < h)
+    valid_neg = (X_neg >= 0) & (X_neg < w) & (Y_neg >= 0) & (Y_neg < h)
+    energy_pos = np.where(valid_pos, magnitude[np.clip(Y_pos, 0, h-1), np.clip(X_pos, 0, w-1)], 0.0)
+    energy_neg = np.where(valid_neg, magnitude[np.clip(Y_neg, 0, h-1), np.clip(X_neg, 0, w-1)], 0.0)
+    total_energy = energy_pos.sum(axis=0) + energy_neg.sum(axis=0)
+    total_count = valid_pos.sum(axis=0) + valid_neg.sum(axis=0)
+    valid_angles = total_count > 0
+    avg_energies = np.where(valid_angles, total_energy / (total_count + 1e-10), 0.0)
+    if valid_angles.any():
+        min_idx = np.argmin(np.where(valid_angles, avg_energies, np.inf))
+        max_idx = np.argmax(np.where(valid_angles, avg_energies, -np.inf))
+        best_angle = angles_deg[min_idx]
+        min_energy = avg_energies[min_idx]
+        max_energy = avg_energies[max_idx]
+    else:
+        best_angle, min_energy, max_energy = 0.0, 0.0, 0.0
     blur_angle = (best_angle + 90) % 180
     anisotropy = (max_energy - min_energy) / (max_energy + 1e-6)
     kernel_size = 1 if anisotropy < 0.05 else max(1, int(anisotropy * 25))
@@ -271,17 +272,16 @@ def estimate_crf(image):
     h, w = gray.shape
     laplacian = cv2.Laplacian(gray, cv2.CV_64F)
     hf_energy = np.mean(np.abs(laplacian))
-    block_diffs = []
-    for x in range(4, w - 1, 4):
-        block_diffs.append(np.mean(np.abs(gray[:, x] - gray[:, x - 1])))
-    for y in range(4, h - 1, 4):
-        block_diffs.append(np.mean(np.abs(gray[y, :] - gray[y - 1, :])))
-    interior_diffs = []
-    for x in range(3, w - 1, 4):
-        if x % 4 != 0:
-            interior_diffs.append(np.mean(np.abs(gray[:, x] - gray[:, x - 1])))
-    avg_block = np.median(block_diffs) if block_diffs else 0
-    avg_interior = np.median(interior_diffs) if interior_diffs else 1
+    cols_4 = np.arange(4, w - 1, 4)
+    rows_4 = np.arange(4, h - 1, 4)
+    block_diffs_x = np.mean(np.abs(gray[:, cols_4] - gray[:, cols_4 - 1]), axis=0) if len(cols_4) else np.array([])
+    block_diffs_y = np.mean(np.abs(gray[rows_4, :] - gray[rows_4 - 1, :]), axis=1) if len(rows_4) else np.array([])
+    block_diffs = np.concatenate([block_diffs_x, block_diffs_y])
+    cols_interior = np.arange(3, w - 1, 4)
+    cols_interior = cols_interior[cols_interior % 4 != 0]
+    interior_diffs = np.mean(np.abs(gray[:, cols_interior] - gray[:, cols_interior - 1]), axis=0) if len(cols_interior) else np.array([])
+    avg_block = np.median(block_diffs) if len(block_diffs) else 0
+    avg_interior = np.median(interior_diffs) if len(interior_diffs) else 1
     blockiness = avg_block / (avg_interior + 1e-6)
     if hf_energy > 30:
         crf_from_hf = 15
@@ -433,7 +433,7 @@ def paste_unedited_regions(aligned, target, mask):
 
 # ============== Alignment Pipeline ==============
 
-def align_image(source_img, target_img, pp_level=2):
+def align_image(source_img, target_img, pp_level=2, paste_back=True):
     target_h, target_w = target_img.shape[:2]
     target_size = (target_w, target_h)
     source_resized = cv2.resize(source_img, target_size, interpolation=cv2.INTER_LANCZOS4)
@@ -458,18 +458,21 @@ def align_image(source_img, target_img, pp_level=2):
     else:
         aligned = source_resized
 
-    result = full_histogram_matching(aligned, target_img, mask=color_mask)
+    result = fast_color_transfer(aligned, target_img, mask=color_mask)
 
-    # Paste back unedited regions from target
+    # Optionally paste back unedited regions from target
     pre_paste = result.copy()
-    unedited_mask = detect_unedited_mask(result, target_img)
-    result = paste_unedited_regions(result, target_img, unedited_mask)
+    unedited_mask = None
+    if paste_back:
+        unedited_mask = detect_unedited_mask(result, target_img)
+        result = paste_unedited_regions(result, target_img, unedited_mask)
 
     # Post-processing (only affects edited regions, then re-paste)
     pp_result = None
     if pp_level > 0:
         pp_result = postprocess_foreground(result, target_img, level=pp_level)
-        pp_result = paste_unedited_regions(pp_result, target_img, unedited_mask)
+        if paste_back and unedited_mask is not None:
+            pp_result = paste_unedited_regions(pp_result, target_img, unedited_mask)
 
     final = pp_result if pp_result is not None else result
     return final, naive_resized, result, pre_paste, unedited_mask, pp_result
@@ -578,7 +581,8 @@ def encode_image_png(img: np.ndarray) -> bytes:
 async def align_api(
     source: UploadFile = File(..., description="Source image to align"),
     target: UploadFile = File(..., description="Target reference image"),
-    pp: int = Form(2, description="Post-processing level 0-3 (0=none, default=2)")
+    pp: int = Form(2, description="Post-processing level 0-3 (0=none, default=2)"),
+    paste_back: bool = Form(True, description="Paste back unedited regions from target (default=true)")
 ):
     """
     Align source image to target image.
@@ -595,7 +599,7 @@ async def align_api(
         if source_img is None or target_img is None:
             raise HTTPException(status_code=400, detail="Failed to decode images")
 
-        final, *_ = align_image(source_img, target_img, pp_level=pp_level)
+        final, *_ = align_image(source_img, target_img, pp_level=pp_level, paste_back=paste_back)
         png_bytes = encode_image_png(final)
 
         return Response(content=png_bytes, media_type="image/png")
@@ -608,7 +612,8 @@ async def align_api(
 async def align_base64_api(
     source: UploadFile = File(...),
     target: UploadFile = File(...),
-    pp: int = Form(2, description="Post-processing level 0-3 (0=none, default=2)")
+    pp: int = Form(2, description="Post-processing level 0-3 (0=none, default=2)"),
+    paste_back: bool = Form(True, description="Paste back unedited regions from target (default=true)")
 ):
     """
     Align source image to target image.
@@ -625,7 +630,7 @@ async def align_base64_api(
         if source_img is None or target_img is None:
             raise HTTPException(status_code=400, detail="Failed to decode images")
 
-        final, *_ = align_image(source_img, target_img, pp_level=pp_level)
+        final, *_ = align_image(source_img, target_img, pp_level=pp_level, paste_back=paste_back)
         png_bytes = encode_image_png(final)
         b64 = base64.b64encode(png_bytes).decode('utf-8')
 
@@ -639,7 +644,8 @@ async def align_base64_api(
 async def align_viz_api(
     source: UploadFile = File(...),
     target: UploadFile = File(...),
-    pp: int = Form(2, description="Post-processing level 0-3 (0=none, default=2)")
+    pp: int = Form(2, description="Post-processing level 0-3 (0=none, default=2)"),
+    paste_back: bool = Form(True, description="Paste back unedited regions from target (default=true)")
 ):
     """
     Align source image to target and return visualization panel + final result.
@@ -656,7 +662,7 @@ async def align_viz_api(
             raise HTTPException(status_code=400, detail="Failed to decode images")
 
         final, naive_resized, pasted, pre_paste, unedited_mask, pp_result = \
-            align_image(source_img, target_img, pp_level=pp_level)
+            align_image(source_img, target_img, pp_level=pp_level, paste_back=paste_back)
 
         panel = create_visualization_panel(
             naive_resized, pasted, target_img,
@@ -848,6 +854,10 @@ HTML_CONTENT = """
                 <option value="2" selected>2 - Medium (default)</option>
                 <option value="3">3 - Strong</option>
             </select>
+            <label style="display:flex;align-items:center;gap:0.4rem;cursor:pointer;">
+                <input type="checkbox" id="pasteBack" checked style="width:18px;height:18px;cursor:pointer;">
+                Paste back unedited regions
+            </label>
         </div>
 
         <button class="btn" id="alignBtn" disabled onclick="alignImages()">&#10024; Align Images</button>
@@ -932,6 +942,7 @@ console.log(data.image); // data:image/png;base64,...</code></pre>
                 formData.append('source', sourceFile);
                 formData.append('target', targetFile);
                 formData.append('pp', document.getElementById('ppLevel').value);
+                formData.append('paste_back', document.getElementById('pasteBack').checked ? 'true' : 'false');
 
                 const response = await fetch('/api/align/viz', {
                     method: 'POST',
