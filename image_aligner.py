@@ -178,6 +178,18 @@ def compute_affine(kp1: list, kp2: list, matches: list,
     return None, None
 
 
+def homography_deviation(H: np.ndarray, width: int, height: int) -> float:
+    """
+    Measure how much a homography deviates from identity by computing the
+    mean displacement of the four image corners (in pixels).
+    """
+    H_norm = H / H[2, 2]
+    corners = np.float32([[0, 0], [width, 0], [width, height], [0, height]]).reshape(-1, 1, 2)
+    warped = cv2.perspectiveTransform(corners, H_norm)
+    displacement = np.sqrt(np.sum((warped.reshape(-1, 2) - corners.reshape(-1, 2)) ** 2, axis=1))
+    return float(np.mean(displacement))
+
+
 def apply_transform(img: np.ndarray, H: np.ndarray,
                     output_size: tuple[int, int]) -> np.ndarray:
     """Apply homography/affine transform to image."""
@@ -576,7 +588,7 @@ def full_histogram_matching(source: np.ndarray, target: np.ndarray,
 
 def detect_unedited_mask(aligned: np.ndarray, target: np.ndarray,
                          threshold: int = 45, min_edit_area: int = 2000,
-                         safety_radius: int = 8, blur_size: int = 31) -> np.ndarray:
+                         safety_radius: int = 40, blur_size: int = 31) -> np.ndarray:
     """
     Detect which pixels are close enough to the target to be considered unedited.
 
@@ -1215,6 +1227,8 @@ def align_image(source_img: np.ndarray, target_img: np.ndarray,
     inlier_mask = None
     inlier_matches = None
     inlier_kp_tgt = None
+    skip_warp = False
+    max_deviation_px = 100  # Max mean corner displacement before skipping warp
 
     # Step 4: Compute geometric transform
     if len(matches) >= 4:
@@ -1228,19 +1242,29 @@ def align_image(source_img: np.ndarray, target_img: np.ndarray,
             inliers = np.sum(mask) if mask is not None else 0
             print(f"    Inliers: {inliers}/{len(matches)}")
 
-            # Store inlier information for color masking
-            if mask is not None:
-                inlier_mask = mask.ravel()
-                inlier_matches = matches
-                inlier_kp_tgt = kp_tgt
+            deviation = homography_deviation(H, target_w, target_h)
+            print(f"    Homography deviation from identity: {deviation:.1f}px (threshold: {max_deviation_px}px)")
 
-            # Apply geometric transformation
-            aligned = apply_transform(source_resized, H, target_size)
+            if deviation > max_deviation_px:
+                print(f"    Warning: Homography deviates too far from identity, skipping geometric warp")
+                skip_warp = True
+                aligned = source_resized
+            else:
+                # Store inlier information for color masking
+                if mask is not None:
+                    inlier_mask = mask.ravel()
+                    inlier_matches = matches
+                    inlier_kp_tgt = kp_tgt
+
+                # Apply geometric transformation
+                aligned = apply_transform(source_resized, H, target_size)
         else:
             print("    Warning: Could not compute transform, using resized image")
+            skip_warp = True
             aligned = source_resized
     else:
         print("    Warning: Not enough matches, using resized image")
+        skip_warp = True
         aligned = source_resized
 
     # Step 5: Create background mask from inliers for color matching
@@ -1273,13 +1297,17 @@ def align_image(source_img: np.ndarray, target_img: np.ndarray,
     else:  # 'histogram' or fallback
         result = histogram_matching_rgb(aligned, target_img, mask=color_mask)
 
-    # Step 7: Paste back unedited regions from target
-    print("    Detecting unedited regions and pasting back target pixels...")
+    # Step 7: Paste back unedited regions from target (skip if warp was skipped)
     color_matched_pre_paste = result.copy()
-    unedited_mask = detect_unedited_mask(result, target_img)
-    unedited_coverage = np.mean(unedited_mask) * 100
-    print(f"    Unedited region coverage: {unedited_coverage:.1f}%")
-    result = paste_unedited_regions(result, target_img, unedited_mask)
+    unedited_mask = None
+    if skip_warp:
+        print("    Skipping paste-back (no geometric warp applied)")
+    else:
+        print("    Detecting unedited regions and pasting back target pixels...")
+        unedited_mask = detect_unedited_mask(result, target_img)
+        unedited_coverage = np.mean(unedited_mask) * 100
+        print(f"    Unedited region coverage: {unedited_coverage:.1f}%")
+        result = paste_unedited_regions(result, target_img, unedited_mask)
 
     return result, naive_resized, aligned, color_matched_pre_paste, unedited_mask
 

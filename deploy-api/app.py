@@ -68,6 +68,14 @@ def compute_homography(kp1, kp2, matches, ransac_reproj_thresh=8.0, confidence=0
     return H, mask
 
 
+def homography_deviation(H, width, height):
+    H_norm = H / H[2, 2]
+    corners = np.float32([[0, 0], [width, 0], [width, height], [0, height]]).reshape(-1, 1, 2)
+    warped = cv2.perspectiveTransform(corners, H_norm)
+    displacement = np.sqrt(np.sum((warped.reshape(-1, 2) - corners.reshape(-1, 2)) ** 2, axis=1))
+    return float(np.mean(displacement))
+
+
 def create_inlier_mask(keypoints, matches, inlier_mask, image_shape, radius=50):
     h, w = image_shape[:2]
     mask_img = np.zeros((h, w), dtype=np.uint8)
@@ -391,7 +399,7 @@ def postprocess_foreground(aligned, target, level=2):
 # ============== Paste-back unedited regions ==============
 
 def detect_unedited_mask(aligned, target, threshold=45, min_edit_area=2000,
-                         safety_radius=8, blur_size=31):
+                         safety_radius=40, blur_size=31):
     diff = cv2.absdiff(aligned, target)
     diff_gray = cv2.cvtColor(diff, cv2.COLOR_BGR2GRAY)
     _, edited_binary = cv2.threshold(diff_gray, threshold, 255, cv2.THRESH_BINARY)
@@ -444,26 +452,35 @@ def align_image(source_img, target_img, pp_level=2, paste_back=True):
     matches = match_features(desc_src, desc_tgt)
 
     color_mask = None
+    skip_warp = False
+    max_deviation_px = 100
     if len(matches) >= 4:
         H, mask = compute_homography(kp_src, kp_tgt, matches)
         if H is not None and mask is not None:
-            inlier_mask = mask.ravel()
-            aligned = cv2.warpPerspective(source_resized, H, target_size,
-                                          flags=cv2.INTER_LANCZOS4,
-                                          borderMode=cv2.BORDER_REPLICATE)
-            color_mask = create_inlier_mask(kp_tgt, matches, inlier_mask,
-                                            target_img.shape, radius=50)
+            deviation = homography_deviation(H, target_w, target_h)
+            if deviation > max_deviation_px:
+                skip_warp = True
+                aligned = source_resized
+            else:
+                inlier_mask = mask.ravel()
+                aligned = cv2.warpPerspective(source_resized, H, target_size,
+                                              flags=cv2.INTER_LANCZOS4,
+                                              borderMode=cv2.BORDER_REPLICATE)
+                color_mask = create_inlier_mask(kp_tgt, matches, inlier_mask,
+                                                target_img.shape, radius=50)
         else:
+            skip_warp = True
             aligned = source_resized
     else:
+        skip_warp = True
         aligned = source_resized
 
     result = fast_color_transfer(aligned, target_img, mask=color_mask)
 
-    # Optionally paste back unedited regions from target
+    # Paste back unedited regions from target (skip if warp was skipped)
     pre_paste = result.copy()
     unedited_mask = None
-    if paste_back:
+    if paste_back and not skip_warp:
         unedited_mask = detect_unedited_mask(result, target_img)
         result = paste_unedited_regions(result, target_img, unedited_mask)
 
@@ -471,7 +488,7 @@ def align_image(source_img, target_img, pp_level=2, paste_back=True):
     pp_result = None
     if pp_level > 0:
         pp_result = postprocess_foreground(result, target_img, level=pp_level)
-        if paste_back and unedited_mask is not None:
+        if paste_back and not skip_warp and unedited_mask is not None:
             pp_result = paste_unedited_regions(pp_result, target_img, unedited_mask)
 
     final = pp_result if pp_result is not None else result
